@@ -1,0 +1,24 @@
+
+--- HistoryLoadWorker error ---
+Traceback (most recent call last):
+  File "c:\Users\MME\My Drive\Trading\autoBot\autoBot-v1\gui\workers.py", line 62, in run
+    df = fetch_klines(self.symbol, self.interval, self.limit)
+         ^^^^^^^^^^^^
+NameError: name 'fetch_klines' is not defined
+
+
+--- HistoryLoadWorker error ---
+Traceback (most recent call last):
+  File "c:\Users\MME\My Drive\Trading\autoBot\autoBot-v1\gui\workers.py", line 62, in run
+    df = fetch_klines(self.symbol, self.interval, self.limit)
+         ^^^^^^^^^^^^
+NameError: name 'fetch_klines' is not defined
+
+
+--- HistoryLoadWorker error ---
+Traceback (most recent call last):
+  File "C:\Users\MME\My Drive\Trading\autoBot\autoBot-v1\gui\workers.py", line 62, in run
+    df = fetch_klines(self.symbol, self.interval, self.limit)
+         ^^^^^^^^^^^^
+NameError: name 'fetch_klines' is not defined
+

@@ -1893,6 +1893,13 @@ class MainWindow(QMainWindow):
         self.lbl_status.setText("History load failed")
         self.lbl_signal.setText(f"Signal: Error")
         self.api_details_display.setPlainText(f"History load error: {message}")
+        try:
+            with open(os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "history_error.log"), "a", encoding="utf-8") as f:
+                f.write("\n--- HistoryLoadWorker error ---\n")
+                f.write(message)
+                f.write("\n")
+        except Exception:
+            pass
 
     def start_market(self):
         self.stop_market()

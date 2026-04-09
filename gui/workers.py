@@ -1,6 +1,16 @@
 import pandas as pd
+import traceback
+from typing import Dict, Any
 from PySide6.QtCore import QThread, Signal
-from algos import build_vrvp, build_session_volume_profile, fetch_agg_trades, build_footprint_from_agg_trades, compute_order_book_features
+from algos import (
+    build_vrvp,
+    build_session_volume_profile,
+    fetch_agg_trades,
+    build_footprint_from_agg_trades,
+    compute_order_book_features,
+    compute_indicators,
+    fetch_klines,
+)
 
 class AnalyticsWorker(QThread):
     data_ready = Signal(dict)
@@ -39,7 +49,7 @@ class AnalyticsWorker(QThread):
 
 
 class HistoryLoadWorker(QThread):
-    loaded = Signal(pd.DataFrame)
+    loaded = Signal(object)
     error = Signal(str)
 
     def __init__(self, symbol: str, interval: str, limit: int):
@@ -53,7 +63,7 @@ class HistoryLoadWorker(QThread):
             df = fetch_klines(self.symbol, self.interval, self.limit)
             df = compute_indicators(df)
             self.loaded.emit(df)
-        except Exception as exc:
-            self.error.emit(str(exc))
+        except Exception:
+            self.error.emit(traceback.format_exc())
 
 
