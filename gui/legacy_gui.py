@@ -1,9 +1,14 @@
+import hmac
+import hashlib
 import json
+import os
 import queue
+import requests
 import time
 from datetime import datetime
 from html import escape
 from typing import Optional, List, Dict, Any
+from urllib.parse import urlencode
 
 import pandas as pd
 from PySide6.QtCore import QTimer, QUrl, QThread, Signal, Qt
@@ -49,6 +54,7 @@ from algos import (
     compute_order_book_features,
     HISTORY_LIMIT,
     MAX_POINTS,
+    REST_BASE,
 )
 
 POLL_MS = 80
@@ -517,6 +523,25 @@ class AnalyticsWorker(QThread):
         self.data_ready.emit(out)
 
 
+class HistoryLoadWorker(QThread):
+    loaded = Signal(pd.DataFrame)
+    error = Signal(str)
+
+    def __init__(self, symbol: str, interval: str, limit: int):
+        super().__init__()
+        self.symbol = symbol
+        self.interval = interval
+        self.limit = limit
+
+    def run(self):
+        try:
+            df = fetch_klines(self.symbol, self.interval, self.limit)
+            df = compute_indicators(df)
+            self.loaded.emit(df)
+        except Exception as exc:
+            self.error.emit(str(exc))
+
+
 class MainWindow(QMainWindow):
     LONG_KEYS = [
         "EMA20 > EMA50",
@@ -560,6 +585,7 @@ class MainWindow(QMainWindow):
         self.feed: Optional[BinanceFeed] = None
         self.depth_feed: Optional[BinanceDepthFeed] = None
         self.worker: Optional[AnalyticsWorker] = None
+        self.history_worker: Optional[HistoryLoadWorker] = None
 
         self.running = False
         self.current_symbol = None
@@ -583,6 +609,16 @@ class MainWindow(QMainWindow):
         self.daily_net_pnl = 0.0
         self.consecutive_losses = 0
         self.last_loss_time: Optional[pd.Timestamp] = None
+
+        self.trade_mode = "DEMO"
+        self.saved_api_key = ""
+        self.saved_api_secret = ""
+        self.api_connection_ok = False
+        self.active_trading_enabled = False
+        self.real_wallet_balance = 0.0
+        self.real_available_balance = 0.0
+        self.real_margin_balance = 0.0
+        self.real_unrealized_profit = 0.0
 
         self.positions_by_symbol: Dict[str, Position] = {}
         self.markers_by_symbol: Dict[str, List[Dict[str, Any]]] = {}
@@ -676,6 +712,16 @@ class MainWindow(QMainWindow):
         self.graph_range.addItems(["100", "200", "300", "500", "800"])
         self.graph_range.setCurrentText("300")
 
+        self.bot_type = QComboBox()
+        self.bot_type.addItems([
+            "Elirox Trend Robot",
+            "Elirox Scalper Robot",
+            "Elirox VSA Robot",
+            "Elirox Breakout Robot",
+            "Custom Strategy",
+        ])
+        self.bot_type.setCurrentText("Elirox Trend Robot")
+
         self.auto_follow = QCheckBox("Auto Follow Chart")
         self.auto_follow.setChecked(True)
 
@@ -708,6 +754,7 @@ class MainWindow(QMainWindow):
         fields = [
             ("Symbol", self.symbol),
             ("Interval", self.interval),
+            ("Bot Type", self.bot_type),
             ("Start Balance", self.start_balance),
             ("Capital / Trade", self.capital_trade),
             ("Leverage", self.leverage),
@@ -734,11 +781,25 @@ class MainWindow(QMainWindow):
         self.btn_auto_off = QPushButton("Stop Auto")
         self.btn_long = QPushButton("Manual LONG")
         self.btn_short = QPushButton("Manual SHORT")
+        self.btn_toggle_trade_mode = QPushButton("Switch to REAL Trade")
         self.btn_close = QPushButton("Close Position")
         self.btn_reset_stats = QPushButton("Reset Signal Stats")
+        self.trade_mode_label = QLabel("Trading Mode: DEMO")
+        self.trade_mode_label.setStyleSheet("color:#a5b4fc; font-weight:600;")
 
-        for b in [self.btn_apply, self.btn_refresh, self.btn_auto_on, self.btn_auto_off, self.btn_long, self.btn_short, self.btn_close, self.btn_reset_stats]:
+        for b in [
+            self.btn_apply,
+            self.btn_refresh,
+            self.btn_auto_on,
+            self.btn_auto_off,
+            self.btn_long,
+            self.btn_short,
+            self.btn_toggle_trade_mode,
+            self.btn_close,
+            self.btn_reset_stats,
+        ]:
             btn_row.addWidget(b)
+        btn_row.addWidget(self.trade_mode_label)
 
         cg.addLayout(btn_row, 2, 0, 1, len(fields) + 1)
         root.addWidget(controls)
@@ -779,6 +840,7 @@ class MainWindow(QMainWindow):
         self.trades_tab = QWidget()
         self.signal_stats_tab = QWidget()
         self.strategy_tab = QWidget()
+        self.api_tab = QWidget()
         self.orderflow_tab = QWidget()
         self.psychology_tab = QWidget()
 
@@ -786,6 +848,7 @@ class MainWindow(QMainWindow):
         self.tabs.addTab(self.trades_tab, "Trades")
         self.tabs.addTab(self.signal_stats_tab, "Signal Stats")
         self.tabs.addTab(self.strategy_tab, "Strategy")
+        self.tabs.addTab(self.api_tab, "Binance API")
         self.tabs.addTab(self.orderflow_tab, "Order Flow")
         self.tabs.addTab(self.psychology_tab, "Psychology Params")
 
@@ -984,6 +1047,38 @@ class MainWindow(QMainWindow):
         strategy_layout.addWidget(self.txt_strategy_report)
         strategy_layout.addStretch(1)
 
+        api_layout = QVBoxLayout(self.api_tab)
+        api_layout.addWidget(QLabel("Binance API Settings"))
+        self.api_key_input = QLineEdit()
+        self.api_key_input.setPlaceholderText("API Key")
+        self.api_secret_input = QLineEdit()
+        self.api_secret_input.setPlaceholderText("API Secret")
+        self.api_secret_input.setEchoMode(QLineEdit.Password)
+        self.btn_save_api = QPushButton("Save API Keys")
+        self.lbl_api_status = QLabel("API Mode: Demo (keys not saved)")
+        self.lbl_api_status.setWordWrap(True)
+        self.lbl_api_status.setStyleSheet("color:#93c5fd;")
+        api_layout.addWidget(QLabel("API Key"))
+        api_layout.addWidget(self.api_key_input)
+        api_layout.addWidget(QLabel("API Secret"))
+        api_layout.addWidget(self.api_secret_input)
+        api_layout.addWidget(self.btn_save_api)
+        self.btn_test_connection = QPushButton("Test Connection")
+        self.btn_active_trading = QPushButton("Enable Active Trading")
+        self.btn_active_trading.setEnabled(False)
+        self.lbl_active_trading = QLabel("Active Trading: OFF")
+        self.lbl_active_trading.setStyleSheet("color:#f8fafc;")
+        api_layout.addWidget(self.btn_test_connection)
+        api_layout.addWidget(self.btn_active_trading)
+        api_layout.addWidget(self.lbl_active_trading)
+        api_layout.addWidget(self.lbl_api_status)
+        self.api_details_display = QPlainTextEdit()
+        self.api_details_display.setReadOnly(True)
+        self.api_details_display.setStyleSheet("background:#0f172a; color:#e5e7eb; border:1px solid #334155; border-radius:8px; padding:8px;")
+        self.api_details_display.setPlainText("Binance connection details will appear here.")
+        api_layout.addWidget(self.api_details_display)
+        api_layout.addStretch(1)
+
         orderflow_layout = QVBoxLayout(self.orderflow_tab)
         self.orderflow_tabs = QTabWidget()
         self.orderflow_tabs.setStyleSheet(self.tabs.styleSheet())
@@ -1100,12 +1195,37 @@ class MainWindow(QMainWindow):
         self.btn_auto_off.clicked.connect(self.stop_auto)
         self.btn_long.clicked.connect(self.manual_long)
         self.btn_short.clicked.connect(self.manual_short)
+        self.btn_toggle_trade_mode.clicked.connect(self.toggle_trade_mode)
         self.btn_close.clicked.connect(self.manual_close)
         self.btn_reset_stats.clicked.connect(self.reset_signal_stats)
+        self.btn_save_api.clicked.connect(self.save_api_keys)
+        self.btn_test_connection.clicked.connect(self.test_binance_connection)
+        self.btn_active_trading.clicked.connect(self.toggle_active_trading)
         self.btn_run_strategy.clicked.connect(self.run_strategy)
+
+        for btn in [
+            self.btn_apply,
+            self.btn_refresh,
+            self.btn_auto_on,
+            self.btn_auto_off,
+            self.btn_long,
+            self.btn_short,
+            self.btn_toggle_trade_mode,
+            self.btn_close,
+            self.btn_reset_stats,
+            self.btn_save_api,
+            self.btn_test_connection,
+            self.btn_active_trading,
+            self.btn_run_strategy,
+        ]:
+            btn.clicked.connect(self.play_click_sound)
 
         self.refresh_condition_button_texts()
         self.refresh_psychology_tab()
+        self.load_saved_api_keys()
+        self.update_trade_mode_button()
+        self.update_active_trading_button()
+        self.update_real_mode_styles()
 
     def current_symbol_key(self) -> str:
         return self.symbol.currentText().strip().upper()
@@ -1821,6 +1941,7 @@ class MainWindow(QMainWindow):
 
         html = [
             f"<h3 style='color:#93c5fd; margin:0 0 10px 0;'>Strategy Run Result</h3>",
+            f"<div style='color:#c7d2fe; margin-bottom:6px;'>Bot Type: <strong>{escape(self.bot_type.currentText())}</strong></div>",
             f"<div style='color:#e2e8f0; margin-bottom:8px;'>Long Score: <strong>{long_score:.2f}</strong> | Short Score: <strong>{short_score:.2f}</strong></div>",
             f"<div style='color:#38bdf8; margin-bottom:12px;'>Long Ready: <strong>{'YES' if long_ready else 'NO'}</strong> | Short Ready: <strong>{'YES' if short_ready else 'NO'}</strong></div>",
             "<table width='100%' cellspacing='6' cellpadding='0'>",
@@ -1861,6 +1982,202 @@ class MainWindow(QMainWindow):
             f"Signal Score | Long: {scored.get('long_score_user', scored.get('long_score', 0.0)):.2f} | "
             f"Short: {scored.get('short_score_user', scored.get('short_score', 0.0)):.2f}"
         )
+
+    def set_demo_trade_mode(self):
+        self.trade_mode = "DEMO"
+        self.trade_mode_label.setText("Trading Mode: DEMO")
+        self.lbl_status.setText("Trading mode set to DEMO")
+        self.update_trade_mode_button()
+
+    def set_real_trade_mode(self):
+        self.trade_mode = "REAL"
+        self.trade_mode_label.setText("Trading Mode: REAL")
+        self.lbl_status.setText("Trading mode set to REAL")
+        self.update_trade_mode_button()
+        if self.api_connection_ok:
+            self.refresh_real_asset_labels()
+
+    def save_api_keys(self):
+        self.saved_api_key = self.api_key_input.text().strip()
+        self.saved_api_secret = self.api_secret_input.text().strip()
+        if self.saved_api_key and self.saved_api_secret:
+            try:
+                with open(self.credentials_path(), "w", encoding="utf-8") as f:
+                    f.write(f"api_key={self.saved_api_key}\n")
+                    f.write(f"api_secret={self.saved_api_secret}\n")
+                self.lbl_api_status.setText("API keys saved to file. Please press Test Connection.")
+                self.api_connection_ok = False
+            except Exception as exc:
+                self.lbl_api_status.setText(f"Failed to save credentials: {exc}")
+        else:
+            self.lbl_api_status.setText("API keys missing or invalid. Please enter both key and secret.")
+            self.api_connection_ok = False
+        self.update_trade_mode_button()
+        self.update_active_trading_button()
+        self.refresh_trade_status_bar()
+
+    def credentials_path(self) -> str:
+        return os.path.join(os.path.dirname(os.path.abspath(__file__)), "binance_credentials.txt")
+
+    def load_saved_api_keys(self):
+        path = self.credentials_path()
+        if not os.path.exists(path):
+            return
+        try:
+            with open(path, "r", encoding="utf-8") as f:
+                for line in f:
+                    if "=" not in line:
+                        continue
+                    key, value = line.strip().split("=", 1)
+                    if key == "api_key":
+                        self.saved_api_key = value
+                    elif key == "api_secret":
+                        self.saved_api_secret = value
+            if self.saved_api_key:
+                self.api_key_input.setText(self.saved_api_key)
+            if self.saved_api_secret:
+                self.api_secret_input.setText(self.saved_api_secret)
+            if self.saved_api_key and self.saved_api_secret:
+                self.lbl_api_status.setText("Loaded saved API keys. Press Test Connection.")
+        except Exception as exc:
+            self.lbl_api_status.setText(f"Unable to load saved keys: {exc}")
+
+    def sign_query(self, params: Dict[str, Any]) -> str:
+        query = urlencode({k: v for k, v in params.items() if v is not None})
+        return hmac.new(self.saved_api_secret.encode("utf-8"), query.encode("utf-8"), hashlib.sha256).hexdigest()
+
+    def build_signed_request(self, path: str, params: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+        if params is None:
+            params = {}
+        params["timestamp"] = int(time.time() * 1000)
+        params["recvWindow"] = 5000
+        signature = self.sign_query(params)
+        params["signature"] = signature
+        headers = {"X-MBX-APIKEY": self.saved_api_key}
+        resp = requests.get(f"{REST_BASE}{path}", params=params, headers=headers, timeout=15)
+        resp.raise_for_status()
+        return resp.json()
+
+    def test_binance_connection(self):
+        self.api_details_display.clear()
+        lines = []
+        self.api_connection_ok = False
+        try:
+            exchange_resp = requests.get(f"{REST_BASE}/fapi/v1/exchangeInfo", timeout=15)
+            exchange_resp.raise_for_status()
+            exchange_info = exchange_resp.json()
+            symbols = len(exchange_info.get("symbols", []))
+            lines.append(f"Public Binance connection OK. Symbols available: {symbols}")
+            if self.saved_api_key and self.saved_api_secret:
+                account_info = self.build_signed_request("/fapi/v2/account")
+                can_trade = account_info.get("canTrade", False)
+                positions = account_info.get("positions", [])
+                positions_open = sum(1 for pos in positions if float(pos.get("positionAmt", 0)) != 0)
+                self.real_wallet_balance = float(account_info.get("totalWalletBalance", 0.0))
+                self.real_available_balance = float(account_info.get("availableBalance", account_info.get("availableMargin", 0.0)))
+                self.real_margin_balance = float(account_info.get("totalMarginBalance", 0.0))
+                self.real_unrealized_profit = float(account_info.get("totalUnrealizedProfit", 0.0))
+                lines.append(f"Authenticated account OK. canTrade={can_trade}, open positions={positions_open}")
+                if self.real_wallet_balance is not None:
+                    lines.append(f"Wallet balance: {self.real_wallet_balance:.4f} USDT")
+                lines.append(f"Available margin: {self.real_available_balance:.4f} USDT")
+                self.api_connection_ok = True
+                assets = [a for a in account_info.get("assets", []) if float(a.get("walletBalance", 0)) != 0]
+                if assets:
+                    lines.append("Non-zero asset balances:")
+                    for asset in assets[:6]:
+                        lines.append(f"  {asset.get('asset')}: {float(asset.get('walletBalance',0)):.4f}")
+            else:
+                lines.append("No API credentials available. Only public data fetched.")
+                self.api_connection_ok = False
+            self.lbl_api_status.setText("Binance test connection completed.")
+            if self.trade_mode == "REAL":
+                self.refresh_real_asset_labels()
+        except Exception as exc:
+            lines.append(f"Connection failed: {exc}")
+            self.lbl_api_status.setText(f"Connection failed: {exc}")
+            self.api_connection_ok = False
+        self.api_details_display.setPlainText("\n".join(lines))
+        self.update_trade_mode_button()
+        self.update_active_trading_button()
+
+    def toggle_active_trading(self):
+        if self.trade_mode == "REAL" and not self.api_connection_ok:
+            self.lbl_api_status.setText("Unable to enable active trading: real mode requires a successful Binance connection.")
+            return
+        self.active_trading_enabled = not self.active_trading_enabled
+        self.lbl_active_trading.setText(
+            "Active Trading: ON" if self.active_trading_enabled else "Active Trading: OFF"
+        )
+        self.btn_active_trading.setText(
+            "Disable Active Trading" if self.active_trading_enabled else "Enable Active Trading"
+        )
+        self.lbl_api_status.setText(
+            "Active trading enabled." if self.active_trading_enabled else "Active trading disabled."
+        )
+
+    def update_trade_mode_button(self):
+        if self.trade_mode == "DEMO":
+            self.btn_toggle_trade_mode.setText("Switch to REAL Trade")
+        else:
+            self.btn_toggle_trade_mode.setText("Switch to DEMO Trade")
+        self.btn_toggle_trade_mode.setEnabled(
+            (self.trade_mode == "DEMO" and bool(self.saved_api_key and self.saved_api_secret and self.api_connection_ok))
+            or self.trade_mode == "REAL"
+        )
+        self.update_real_mode_styles()
+
+    def update_real_mode_styles(self):
+        if self.trade_mode == "REAL":
+            style = "background:#7f1d1d; color:#fde2e2; border:1px solid #f87171;"
+        else:
+            style = ""
+        for btn in [
+            self.btn_apply,
+            self.btn_refresh,
+            self.btn_auto_on,
+            self.btn_auto_off,
+            self.btn_long,
+            self.btn_short,
+            self.btn_toggle_trade_mode,
+            self.btn_close,
+            self.btn_reset_stats,
+            self.btn_save_api,
+            self.btn_test_connection,
+            self.btn_active_trading,
+            self.btn_run_strategy,
+        ]:
+            btn.setStyleSheet(style)
+
+    def refresh_real_asset_labels(self):
+        self.lbl_balance.setText(f"Total Balance: {self.real_wallet_balance:.2f} USDT")
+        self.lbl_available.setText(f"Available: {self.real_available_balance:.2f} USDT")
+        self.lbl_equity.setText(f"Equity: {self.real_margin_balance:.2f} USDT")
+        self.lbl_live_pnl.setText(f"Unrealized PnL: {self.real_unrealized_profit:.2f} USDT")
+
+    def play_click_sound(self):
+        try:
+            if hasattr(winsound, 'MessageBeep'):
+                winsound.MessageBeep(winsound.MB_OK)
+        except Exception:
+            pass
+
+    def update_active_trading_button(self):
+        self.btn_active_trading.setEnabled(
+            self.trade_mode == "DEMO" or self.api_connection_ok
+        )
+
+    def toggle_trade_mode(self):
+        if self.trade_mode == "DEMO":
+            if not (self.saved_api_key and self.saved_api_secret):
+                self.lbl_api_status.setText("Enter and save Binance API keys before switching to REAL mode.")
+                return
+            if not self.api_connection_ok:
+                self.lbl_api_status.setText("Please test Binance connection before switching to REAL mode.")
+                return
+            self.set_real_trade_mode()
+        else:
+            self.set_demo_trade_mode()
 
     def marker_time(self, ts: pd.Timestamp):
         return int(ts.timestamp())
@@ -2015,8 +2332,18 @@ class MainWindow(QMainWindow):
         self.lbl_status.setText(f"Loading {symbol} {interval}...")
         self.ensure_daily_stats_current()
 
-        self.df = fetch_klines(symbol, interval, HISTORY_LIMIT)
-        self.df = compute_indicators(self.df)
+        if self.history_worker is not None and self.history_worker.isRunning():
+            return
+
+        self.history_worker = HistoryLoadWorker(symbol, interval, HISTORY_LIMIT)
+        self.history_worker.loaded.connect(self.on_history_loaded)
+        self.history_worker.error.connect(self.on_history_error)
+        self.history_worker.finished.connect(self.history_worker.deleteLater)
+        self.history_worker.start()
+
+    def on_history_loaded(self, df: pd.DataFrame):
+        self.history_worker = None
+        self.df = df
         self.last_closed_candle_time = self.df.iloc[-1]["open_time"] if not self.df.empty else None
 
         if not self.closed_trades and not self.positions_by_symbol:
@@ -2030,11 +2357,17 @@ class MainWindow(QMainWindow):
             self.consecutive_losses = 0
             self.last_loss_time = None
 
-        self.lbl_status.setText(f"Market stream live: {symbol} {interval}")
+        self.lbl_status.setText(f"Market stream live: {self.current_symbol_key()} {self.interval.currentText().strip()}")
         self.lbl_signal.setText("Signal: Waiting")
         self.refresh_panels()
         self.sync_chart_full()
         self.start_analytics_worker(force=True)
+
+    def on_history_error(self, message: str):
+        self.history_worker = None
+        self.lbl_status.setText("History load failed")
+        self.lbl_signal.setText(f"Signal: Error")
+        self.api_details_display.setPlainText(f"History load error: {message}")
 
     def start_market(self):
         self.stop_market()
@@ -2133,7 +2466,7 @@ class MainWindow(QMainWindow):
             qty=qty,
             entry_fee=entry_fee,
             bars_held=0,
-            source=source,
+            source=f"{source}-{self.trade_mode.lower()}",
             score_at_entry=score_at_entry,
             entry_signals=entry_snapshot["true_signals"],
             entry_snapshot=entry_snapshot,
