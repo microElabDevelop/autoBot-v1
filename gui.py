@@ -778,12 +778,14 @@ class MainWindow(QMainWindow):
         self.dashboard_tab = QWidget()
         self.trades_tab = QWidget()
         self.signal_stats_tab = QWidget()
+        self.strategy_tab = QWidget()
         self.orderflow_tab = QWidget()
         self.psychology_tab = QWidget()
 
         self.tabs.addTab(self.dashboard_tab, "Dashboard")
         self.tabs.addTab(self.trades_tab, "Trades")
         self.tabs.addTab(self.signal_stats_tab, "Signal Stats")
+        self.tabs.addTab(self.strategy_tab, "Strategy")
         self.tabs.addTab(self.orderflow_tab, "Order Flow")
         self.tabs.addTab(self.psychology_tab, "Psychology Params")
 
@@ -960,6 +962,28 @@ class MainWindow(QMainWindow):
         """)
         stats_layout.addWidget(self.tbl_signal_stats)
 
+        strategy_layout = QVBoxLayout(self.strategy_tab)
+        strategy_layout.addWidget(QLabel("Strategy Runner"))
+        self.btn_run_strategy = QPushButton("Run Strategy Now")
+        self.btn_run_strategy.setToolTip("Evaluate current candle and display strategy signals and readiness.")
+        strategy_layout.addWidget(self.btn_run_strategy)
+        self.txt_strategy_report = QTextBrowser()
+        self.txt_strategy_report.setOpenExternalLinks(False)
+        self.txt_strategy_report.setStyleSheet("""
+            QTextBrowser {
+                background:#0f172a;
+                color:#e5e7eb;
+                border:1px solid #334155;
+                border-radius:8px;
+                padding:10px;
+                font-family: 'Segoe UI';
+                font-size: 13px;
+            }
+        """)
+        self.txt_strategy_report.setHtml("<i>Press \"Run Strategy Now\" to evaluate the current market signal.</i>")
+        strategy_layout.addWidget(self.txt_strategy_report)
+        strategy_layout.addStretch(1)
+
         orderflow_layout = QVBoxLayout(self.orderflow_tab)
         self.orderflow_tabs = QTabWidget()
         self.orderflow_tabs.setStyleSheet(self.tabs.styleSheet())
@@ -1078,6 +1102,7 @@ class MainWindow(QMainWindow):
         self.btn_short.clicked.connect(self.manual_short)
         self.btn_close.clicked.connect(self.manual_close)
         self.btn_reset_stats.clicked.connect(self.reset_signal_stats)
+        self.btn_run_strategy.clicked.connect(self.run_strategy)
 
         self.refresh_condition_button_texts()
         self.refresh_psychology_tab()
@@ -1775,6 +1800,68 @@ class MainWindow(QMainWindow):
         html.append("</table>")
         self.txt_psychology_eval.setHtml("".join(html))
 
+    def refresh_strategy_tab(self, scored: Optional[Dict[str, Any]] = None):
+        if not hasattr(self, "txt_strategy_report"):
+            return
+
+        if scored is None:
+            scored = self.score_current_row()
+        if scored is None:
+            self.txt_strategy_report.setHtml(
+                "<i>No signal data available yet. Load history or wait for more candles.</i>"
+            )
+            return
+
+        long_reasons = scored.get("long_reasons_user", scored.get("long_reasons", []))
+        short_reasons = scored.get("short_reasons_user", scored.get("short_reasons", []))
+        long_score = scored.get("long_score_user", scored.get("long_score", 0.0))
+        short_score = scored.get("short_score_user", scored.get("short_score", 0.0))
+        long_ready = scored.get("long_ready_user", False)
+        short_ready = scored.get("short_ready_user", False)
+
+        html = [
+            f"<h3 style='color:#93c5fd; margin:0 0 10px 0;'>Strategy Run Result</h3>",
+            f"<div style='color:#e2e8f0; margin-bottom:8px;'>Long Score: <strong>{long_score:.2f}</strong> | Short Score: <strong>{short_score:.2f}</strong></div>",
+            f"<div style='color:#38bdf8; margin-bottom:12px;'>Long Ready: <strong>{'YES' if long_ready else 'NO'}</strong> | Short Ready: <strong>{'YES' if short_ready else 'NO'}</strong></div>",
+            "<table width='100%' cellspacing='6' cellpadding='0'>",
+            "<tr><td width='50%' style='vertical-align:top; padding-right:8px;'>",
+            "<div style='color:#22d3ee; font-weight:700; margin-bottom:4px;'>Long Conditions Met</div>",
+        ]
+
+        if long_reasons:
+            html.extend([f"<div style='color:#e2e8f0; margin-bottom:2px;'>- {escape(str(item))}</div>" for item in long_reasons])
+        else:
+            html.append("<div style='color:#94a3b8;'>No long conditions met.</div>")
+
+        html.extend([
+            "</td><td width='50%' style='vertical-align:top; padding-left:8px;'>",
+            "<div style='color:#22d3ee; font-weight:700; margin-bottom:4px;'>Short Conditions Met</div>",
+        ])
+
+        if short_reasons:
+            html.extend([f"<div style='color:#e2e8f0; margin-bottom:2px;'>- {escape(str(item))}</div>" for item in short_reasons])
+        else:
+            html.append("<div style='color:#94a3b8;'>No short conditions met.</div>")
+
+        html.extend(["</td></tr></table>"])
+        self.txt_strategy_report.setHtml("".join(html))
+
+    def run_strategy(self):
+        scored = self.score_current_row()
+        if scored is None:
+            self.txt_strategy_report.setHtml(
+                "<i>Cannot run strategy until sufficient candle history is loaded.</i>"
+            )
+            return
+
+        report = self.build_trade_status_text(scored)
+        self.refresh_strategy_tab(scored)
+        self.lbl_signal.setText(f"Signal: {report}")
+        self.lbl_score.setText(
+            f"Signal Score | Long: {scored.get('long_score_user', scored.get('long_score', 0.0)):.2f} | "
+            f"Short: {scored.get('short_score_user', scored.get('short_score', 0.0)):.2f}"
+        )
+
     def marker_time(self, ts: pd.Timestamp):
         return int(ts.timestamp())
 
@@ -1859,6 +1946,9 @@ class MainWindow(QMainWindow):
         if len(self.df) < 220:
             return None
 
+        if "ema20" not in self.df.columns or "ema50" not in self.df.columns or "ema200" not in self.df.columns:
+            self.df = compute_indicators(self.df)
+
         scored = score_row(self.df, len(self.df) - 1)
         long_selected = self.selected_long_checks()
         short_selected = self.selected_short_checks()
@@ -1926,6 +2016,7 @@ class MainWindow(QMainWindow):
         self.ensure_daily_stats_current()
 
         self.df = fetch_klines(symbol, interval, HISTORY_LIMIT)
+        self.df = compute_indicators(self.df)
         self.last_closed_candle_time = self.df.iloc[-1]["open_time"] if not self.df.empty else None
 
         if not self.closed_trades and not self.positions_by_symbol:
@@ -2493,6 +2584,7 @@ class MainWindow(QMainWindow):
         self.refresh_trade_tab()
         self.refresh_signal_stats_tab()
         self.refresh_psychology_tab()
+        self.refresh_strategy_tab(scored)
 
     def check_exit(self, pos: Position, row: pd.Series):
         tp_pct = float(self.tp.text())
