@@ -1,10 +1,10 @@
-"""Data fetchers for Binance klines, agg trades, and live websocket feeds."""
+"""Data fetchers for Binance klines, agg trades, market scans, and live websocket feeds."""
 
 import json
 import queue
 import threading
 import time
-from typing import Dict, Any, Optional
+from typing import Dict, Any, Optional, List
 
 import pandas as pd
 import requests
@@ -87,6 +87,89 @@ def fetch_agg_trades(symbol: str, limit: int = 220) -> pd.DataFrame:
             "is_buy_aggressor": not is_sell_aggressor,
         })
     return pd.DataFrame(data)
+
+
+def fetch_futures_symbols(
+    quote_asset: str = "USDT",
+    status: str = "TRADING",
+    contract_type: str = "PERPETUAL",
+    limit: Optional[int] = None,
+) -> List[str]:
+    session = retry_session()
+    r = session.get(f"{REST_BASE}/fapi/v1/exchangeInfo", timeout=20)
+    r.raise_for_status()
+    payload = r.json()
+
+    symbols: List[str] = []
+    for item in payload.get("symbols", []):
+        sym = str(item.get("symbol", "")).upper()
+        if not sym:
+            continue
+        if quote_asset and str(item.get("quoteAsset", "")).upper() != quote_asset.upper():
+            continue
+        if status and str(item.get("status", "")).upper() != status.upper():
+            continue
+        if contract_type and str(item.get("contractType", "")).upper() != contract_type.upper():
+            continue
+        symbols.append(sym)
+
+    if limit is not None:
+        return symbols[: max(0, int(limit))]
+    return symbols
+
+
+def fetch_futures_24h_tickers() -> List[Dict[str, Any]]:
+    session = retry_session()
+    r = session.get(f"{REST_BASE}/fapi/v1/ticker/24hr", timeout=20)
+    r.raise_for_status()
+    data = r.json()
+    if isinstance(data, dict):
+        return [data]
+    return data if isinstance(data, list) else []
+
+
+def scan_futures_movers(
+    min_up_pct: float = 3.0,
+    top_n: int = 8,
+    quote_asset: str = "USDT",
+) -> Dict[str, Any]:
+    universe = set(fetch_futures_symbols(quote_asset=quote_asset, status="TRADING", contract_type="PERPETUAL"))
+    tickers = fetch_futures_24h_tickers()
+
+    scanned_count = 0
+    spotted: List[Dict[str, Any]] = []
+
+    for item in tickers:
+        symbol = str(item.get("symbol", "")).upper()
+        if not symbol or (universe and symbol not in universe):
+            continue
+        try:
+            change_pct = float(item.get("priceChangePercent", 0.0))
+            last_price = float(item.get("lastPrice", 0.0))
+            quote_volume = float(item.get("quoteVolume", 0.0))
+        except Exception:
+            continue
+
+        scanned_count += 1
+        if change_pct >= float(min_up_pct):
+            spotted.append({
+                "symbol": symbol,
+                "change_pct": round(change_pct, 2),
+                "last_price": last_price,
+                "quote_volume": quote_volume,
+            })
+
+    spotted.sort(key=lambda row: (row["change_pct"], row["quote_volume"]), reverse=True)
+    top_n = max(1, int(top_n))
+
+    return {
+        "scan_time": str(pd.Timestamp.utcnow()),
+        "universe_name": f"{quote_asset.upper()} Perpetual Futures",
+        "scanned_count": scanned_count,
+        "spotted_total": len(spotted),
+        "spotted": spotted[:top_n],
+        "min_up_pct": float(min_up_pct),
+    }
 
 
 def build_footprint_from_agg_trades(trades_df: pd.DataFrame, price_step: Optional[float] = None) -> Dict[str, Any]:

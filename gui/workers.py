@@ -6,6 +6,7 @@ from algos import (
     build_vrvp,
     build_session_volume_profile,
     fetch_agg_trades,
+    scan_futures_movers,
     build_footprint_from_agg_trades,
     compute_order_book_features,
     compute_indicators,
@@ -66,4 +67,20 @@ class HistoryLoadWorker(QThread):
         except Exception:
             self.error.emit(traceback.format_exc())
 
+
+class AIScannerWorker(QThread):
+    data_ready = Signal(dict)
+    error = Signal(str)
+
+    def __init__(self, min_up_pct: float, top_n: int):
+        super().__init__()
+        self.min_up_pct = float(min_up_pct)
+        self.top_n = int(top_n)
+
+    def run(self):
+        try:
+            result = scan_futures_movers(self.min_up_pct, self.top_n, quote_asset="USDT")
+            self.data_ready.emit(result)
+        except Exception:
+            self.error.emit(traceback.format_exc())
 

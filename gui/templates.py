@@ -17,6 +17,8 @@ let candleSeries = null;
 let ema20 = null;
 let ema50 = null;
 let ema200 = null;
+let aiLimitSeries = [];
+let lastCandles = [];
 let autoFollow = true;
 
 function initChart() {
@@ -48,24 +50,64 @@ function initChart() {
 
 initChart();
 
+function clearAiLimits() {
+    if (!chart) return;
+    (aiLimitSeries || []).forEach(series => {
+        try { chart.removeSeries(series); } catch (e) {}
+    });
+    aiLimitSeries = [];
+}
+
+function drawAiLimits(levels, candles) {
+    clearAiLimits();
+    if (!chart || !levels || !levels.length || !candles || !candles.length) return;
+    const firstTime = candles[0].time;
+    const lastTime = candles[candles.length - 1].time;
+    const colors = ['#fbbf24', '#fb7185', '#34d399', '#60a5fa', '#c084fc'];
+    levels.forEach((level, idx) => {
+        const series = chart.addLineSeries({
+            color: colors[idx % colors.length],
+            lineWidth: 1,
+            lineStyle: 2,
+            priceLineVisible: false,
+            lastValueVisible: false,
+            crosshairMarkerVisible: false,
+        });
+        series.setData([
+            { time: firstTime, value: Number(level) },
+            { time: lastTime, value: Number(level) }
+        ]);
+        aiLimitSeries.push(series);
+    });
+}
+
 window.chartApi = {
     setAutoFollow(v) { autoFollow = !!v; },
-    setAll(candles, e20, e50, e200, markers) {
+    setAll(candles, e20, e50, e200, markers, aiLimits) {
         if (!candleSeries) return;
+        lastCandles = candles || [];
         candleSeries.setData(candles || []);
         ema20.setData(e20 || []);
         ema50.setData(e50 || []);
         ema200.setData(e200 || []);
         candleSeries.setMarkers(markers || []);
+        drawAiLimits(aiLimits || [], lastCandles);
         if (autoFollow && chart) chart.timeScale().scrollToRealTime();
     },
-    updateOne(bar, e20v, e50v, e200v, markers) {
+    updateOne(bar, e20v, e50v, e200v, markers, aiLimits) {
         if (!candleSeries) return;
+        if (lastCandles.length && lastCandles[lastCandles.length - 1].time === bar.time) {
+            lastCandles[lastCandles.length - 1] = bar;
+        } else {
+            lastCandles.push(bar);
+            if (lastCandles.length > 1200) lastCandles = lastCandles.slice(-1200);
+        }
         candleSeries.update(bar);
         if (e20v !== null) ema20.update({ time: bar.time, value: e20v });
         if (e50v !== null) ema50.update({ time: bar.time, value: e50v });
         if (e200v !== null) ema200.update({ time: bar.time, value: e200v });
         candleSeries.setMarkers(markers || []);
+        drawAiLimits(aiLimits || [], lastCandles);
         if (autoFollow && chart) chart.timeScale().scrollToRealTime();
     }
 };

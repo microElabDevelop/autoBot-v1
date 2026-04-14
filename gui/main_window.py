@@ -65,7 +65,7 @@ from algos import (
 POLL_MS = 80
 
 from .templates import CHART_HTML, HEATMAP_HTML, PROFILE_HTML, FOOTPRINT_HTML
-from .workers import AnalyticsWorker, HistoryLoadWorker
+from .workers import AnalyticsWorker, HistoryLoadWorker, AIScannerWorker
 
 class MainWindow(QMainWindow):
     LONG_KEYS = [
@@ -111,6 +111,7 @@ class MainWindow(QMainWindow):
         self.depth_feed: Optional[BinanceDepthFeed] = None
         self.worker: Optional[AnalyticsWorker] = None
         self.history_worker: Optional[HistoryLoadWorker] = None
+        self.ai_scanner_worker: Optional[AIScannerWorker] = None
 
         self.running = False
         self.current_symbol = None
@@ -126,6 +127,7 @@ class MainWindow(QMainWindow):
         self.available_balance = 1000.0
         self.equity = 1000.0
         self.auto_enabled = False
+        self.ai_enabled = False
         self.local_tz = datetime.now().astimezone().tzinfo
         self.session_peak_balance = self.balance_total
         self.daily_start_balance = self.balance_total
@@ -145,7 +147,7 @@ class MainWindow(QMainWindow):
         self.real_margin_balance = 0.0
         self.real_unrealized_profit = 0.0
 
-        self.positions_by_symbol: Dict[str, Position] = {}
+        self.positions_by_symbol: Dict[str, List[Position]] = {}
         self.markers_by_symbol: Dict[str, List[Dict[str, Any]]] = {}
         self.closed_trades: List[ClosedTrade] = []
 
@@ -166,6 +168,34 @@ class MainWindow(QMainWindow):
         self.heatmap_push_interval_sec = 0.35
         self.last_analytics_start_ts = 0.0
         self.analytics_interval_sec = 4.0
+        self.ai_stats: Dict[str, Any] = {
+            "scans_run": 0,
+            "markets_scanned": 0,
+            "opportunities_found": 0,
+            "ai_trades_opened": 0,
+            "ai_trades_closed": 0,
+            "exited_before_dip": 0,
+            "last_scan_time": None,
+            "last_scan_rows": [],
+            "last_min_up_pct": 3.0,
+            "status_msg": "AI engine idle",
+        }
+        self.pending_exit_watch: List[Dict[str, Any]] = []
+        self.ai_pending_entries: List[Dict[str, Any]] = []
+        self.ai_plan_counter = 0
+        self.latest_ai_decision: Dict[str, Any] = {
+            "state": "WAITING",
+            "summary": "Waiting for sufficient data",
+            "side": None,
+            "confidence": 0.0,
+            "long_ai_score": 0.0,
+            "short_ai_score": 0.0,
+            "reasons": [],
+            "blockers": [],
+            "profile": "AI Fusion",
+        }
+        self.ai_overview_html_cache = ""
+        self.ai_scan_rows_signature = ""
 
         self.build_ui()
 
@@ -237,16 +267,6 @@ class MainWindow(QMainWindow):
         self.graph_range.addItems(["100", "200", "300", "500", "800"])
         self.graph_range.setCurrentText("300")
 
-        self.bot_type = QComboBox()
-        self.bot_type.addItems([
-            "Elirox Trend Robot",
-            "Elirox Scalper Robot",
-            "Elirox VSA Robot",
-            "Elirox Breakout Robot",
-            "Custom Strategy",
-        ])
-        self.bot_type.setCurrentText("Elirox Trend Robot")
-
         self.auto_follow = QCheckBox("Auto Follow Chart")
         self.auto_follow.setChecked(True)
 
@@ -279,7 +299,6 @@ class MainWindow(QMainWindow):
         fields = [
             ("Symbol", self.symbol),
             ("Interval", self.interval),
-            ("Bot Type", self.bot_type),
             ("Start Balance", self.start_balance),
             ("Capital / Trade", self.capital_trade),
             ("Leverage", self.leverage),
@@ -304,6 +323,7 @@ class MainWindow(QMainWindow):
         self.btn_refresh = QPushButton("Refresh History")
         self.btn_auto_on = QPushButton("Start Auto")
         self.btn_auto_off = QPushButton("Stop Auto")
+        self.btn_ai_toggle = QPushButton("Enable AI Bot")
         self.btn_long = QPushButton("Manual LONG")
         self.btn_short = QPushButton("Manual SHORT")
         self.btn_toggle_trade_mode = QPushButton("Switch to REAL Trade")
@@ -317,6 +337,7 @@ class MainWindow(QMainWindow):
             self.btn_refresh,
             self.btn_auto_on,
             self.btn_auto_off,
+            self.btn_ai_toggle,
             self.btn_long,
             self.btn_short,
             self.btn_toggle_trade_mode,
@@ -365,6 +386,7 @@ class MainWindow(QMainWindow):
         self.trades_tab = QWidget()
         self.signal_stats_tab = QWidget()
         self.strategy_tab = QWidget()
+        self.ai_bot_tab = QWidget()
         self.api_tab = QWidget()
         self.orderflow_tab = QWidget()
         self.psychology_tab = QWidget()
@@ -373,6 +395,7 @@ class MainWindow(QMainWindow):
         self.tabs.addTab(self.trades_tab, "Trades")
         self.tabs.addTab(self.signal_stats_tab, "Signal Stats")
         self.tabs.addTab(self.strategy_tab, "Strategy")
+        self.tabs.addTab(self.ai_bot_tab, "AI Bot")
         self.tabs.addTab(self.api_tab, "Binance API")
         self.tabs.addTab(self.orderflow_tab, "Order Flow")
         self.tabs.addTab(self.psychology_tab, "Psychology Params")
@@ -397,6 +420,7 @@ class MainWindow(QMainWindow):
 
         self.lbl_status = QLabel("Starting...")
         self.lbl_auto = QLabel("Auto Trading: OFF")
+        self.lbl_ai_bot = QLabel("AI Bot: OFF")
         self.lbl_balance = QLabel("Total Balance: 1000.00")
         self.lbl_available = QLabel("Available Balance: 1000.00")
         self.lbl_equity = QLabel("Equity: 1000.00")
@@ -572,6 +596,109 @@ class MainWindow(QMainWindow):
         strategy_layout.addWidget(self.txt_strategy_report)
         strategy_layout.addStretch(1)
 
+        ai_layout = QVBoxLayout(self.ai_bot_tab)
+        ai_layout.addWidget(QLabel("AI Bot Engine"))
+        ai_sub = QLabel(
+            "The AI bot uses the full signal stack available in this app: trend, momentum, volume, VSA, profiles, order-flow, agreement checks, and risk guards to choose the chart, arm limits, and execute trades."
+        )
+        ai_sub.setStyleSheet("color:#9ca3af;")
+        ai_sub.setWordWrap(True)
+        ai_layout.addWidget(ai_sub)
+
+        ai_controls_frame = QFrame()
+        ai_controls_frame.setStyleSheet("""
+            QFrame { background:#101a2f; border:1px solid #334155; border-radius:8px; }
+            QLabel { color:#e5e7eb; }
+            QLineEdit {
+                background:#16233f; color:#e5e7eb; padding:6px;
+                border:1px solid #24324d; border-radius:4px;
+            }
+            QPushButton {
+                background:#16233f; color:#e5e7eb; padding:8px 12px;
+                border:1px solid #24324d; border-radius:6px;
+            }
+            QPushButton:hover { background:#1d2e4d; }
+            QPushButton:pressed {
+                background:#0f1b33;
+                border:1px solid #60a5fa;
+                padding-top:9px;
+                padding-left:13px;
+            }
+        """)
+        ai_controls = QGridLayout(ai_controls_frame)
+        self.ai_mode = QComboBox()
+        self.ai_mode.addItems(["Optimal", "Aggressive"])
+        self.ai_mode.setCurrentText("Optimal")
+        self.ai_min_move = QLineEdit("3.0")
+        self.ai_top_n = QLineEdit("8")
+        self.btn_ai_scan = QPushButton("Scan Market")
+        self.lbl_ai_scan_status = QLabel("Scanner: idle")
+        self.lbl_ai_scan_status.setStyleSheet("color:#93c5fd; font-weight:600;")
+        ai_controls.addWidget(QLabel("AI Nature"), 0, 0)
+        ai_controls.addWidget(self.ai_mode, 1, 0)
+        ai_controls.addWidget(QLabel("Min Up Move %"), 0, 1)
+        ai_controls.addWidget(self.ai_min_move, 1, 1)
+        ai_controls.addWidget(QLabel("Top Results"), 0, 2)
+        ai_controls.addWidget(self.ai_top_n, 1, 2)
+        ai_controls.addWidget(self.btn_ai_scan, 1, 3)
+        ai_controls.addWidget(self.lbl_ai_scan_status, 1, 4)
+        ai_layout.addWidget(ai_controls_frame)
+
+        self.txt_ai_overview = QTextBrowser()
+        self.txt_ai_overview.setOpenExternalLinks(False)
+        self.txt_ai_overview.setStyleSheet("""
+            QTextBrowser {
+                background:#0f172a;
+                color:#e5e7eb;
+                border:1px solid #334155;
+                border-radius:8px;
+                padding:10px;
+                font-family:'Segoe UI';
+                font-size:13px;
+            }
+        """)
+        ai_layout.addWidget(self.txt_ai_overview)
+
+        ai_layout.addWidget(QLabel("Scanner Opportunities"))
+        self.tbl_ai_scan = QTableWidget()
+        self.tbl_ai_scan.setColumnCount(5)
+        self.tbl_ai_scan.setHorizontalHeaderLabels([
+            "Symbol",
+            "24h Change %",
+            "Last Price",
+            "24h Quote Vol",
+            "AI View",
+        ])
+        self.tbl_ai_scan.setEditTriggers(QTableWidget.NoEditTriggers)
+        self.tbl_ai_scan.setSelectionBehavior(QTableWidget.SelectRows)
+        self.tbl_ai_scan.setSelectionMode(QTableWidget.SingleSelection)
+        self.tbl_ai_scan.setAlternatingRowColors(True)
+        self.tbl_ai_scan.verticalHeader().setVisible(False)
+        self.tbl_ai_scan.horizontalHeader().setStretchLastSection(True)
+        self.tbl_ai_scan.horizontalHeader().setSectionResizeMode(0, QHeaderView.ResizeToContents)
+        self.tbl_ai_scan.horizontalHeader().setSectionResizeMode(1, QHeaderView.ResizeToContents)
+        self.tbl_ai_scan.horizontalHeader().setSectionResizeMode(2, QHeaderView.ResizeToContents)
+        self.tbl_ai_scan.horizontalHeader().setSectionResizeMode(3, QHeaderView.ResizeToContents)
+        self.tbl_ai_scan.setStyleSheet("""
+            QTableWidget {
+                background:#0f172a;
+                color:#e5e7eb;
+                gridline-color:#22304a;
+                border:1px solid #334155;
+                border-radius:8px;
+                selection-background-color:#1d4ed8;
+                alternate-background-color:#111827;
+            }
+            QHeaderView::section {
+                background:#111827;
+                color:#93c5fd;
+                padding:6px;
+                border:0;
+                font-weight:700;
+            }
+        """)
+        ai_layout.addWidget(self.tbl_ai_scan)
+
         api_layout = QVBoxLayout(self.api_tab)
         api_layout.addWidget(QLabel("Binance API Settings"))
         self.api_key_input = QLineEdit()
@@ -648,6 +775,29 @@ class MainWindow(QMainWindow):
 
         psychology_settings_layout = QVBoxLayout(self.psychology_settings_tab)
 
+        self.psych_limits_toggle = QCheckBox("Enable Psychological Limits")
+        self.psych_limits_toggle.setChecked(False)
+        self.psych_limits_toggle.setStyleSheet("""
+            QCheckBox {
+                color:#e5e7eb;
+                font-weight:700;
+                padding:6px 2px;
+            }
+            QCheckBox::indicator {
+                width:36px;
+                height:18px;
+                border-radius:9px;
+                background:#1f2937;
+                border:1px solid #334155;
+            }
+            QCheckBox::indicator:checked {
+                background:#16a34a;
+                border:1px solid #22c55e;
+            }
+        """)
+        self.psych_limits_toggle.toggled.connect(self.on_psych_param_changed)
+        psychology_settings_layout.addWidget(self.psych_limits_toggle)
+
         psychology_frame = QFrame()
         psychology_frame.setStyleSheet("""
             QFrame { background:#101a2f; border-radius:8px; }
@@ -718,6 +868,7 @@ class MainWindow(QMainWindow):
         self.btn_refresh.clicked.connect(self.load_history)
         self.btn_auto_on.clicked.connect(self.start_auto)
         self.btn_auto_off.clicked.connect(self.stop_auto)
+        self.btn_ai_toggle.clicked.connect(self.toggle_ai_bot)
         self.btn_long.clicked.connect(self.manual_long)
         self.btn_short.clicked.connect(self.manual_short)
         self.btn_toggle_trade_mode.clicked.connect(self.toggle_trade_mode)
@@ -727,12 +878,17 @@ class MainWindow(QMainWindow):
         self.btn_test_connection.clicked.connect(self.test_binance_connection)
         self.btn_active_trading.clicked.connect(self.toggle_active_trading)
         self.btn_run_strategy.clicked.connect(self.run_strategy)
+        self.btn_ai_scan.clicked.connect(self.run_ai_scan)
+        self.ai_mode.currentTextChanged.connect(lambda _=None: self.refresh_panels())
+        for field in [self.capital_trade, self.leverage, self.tp, self.sl, self.max_hold, self.fee, self.min_score]:
+            field.textChanged.connect(self.on_runtime_param_changed)
 
         for btn in [
             self.btn_apply,
             self.btn_refresh,
             self.btn_auto_on,
             self.btn_auto_off,
+            self.btn_ai_toggle,
             self.btn_long,
             self.btn_short,
             self.btn_toggle_trade_mode,
@@ -742,11 +898,13 @@ class MainWindow(QMainWindow):
             self.btn_test_connection,
             self.btn_active_trading,
             self.btn_run_strategy,
+            self.btn_ai_scan,
         ]:
             btn.clicked.connect(self.play_click_sound)
 
         self.refresh_condition_button_texts()
         self.refresh_psychology_tab()
+        self.refresh_ai_bot_tab()
         self.load_saved_api_keys()
         self.update_trade_mode_button()
         self.update_active_trading_button()
@@ -761,15 +919,52 @@ class MainWindow(QMainWindow):
     def set_current_markers(self, markers: List[Dict[str, Any]]):
         self.markers_by_symbol[self.current_symbol_key()] = markers
 
+    def positions_for_symbol(self, symbol: Optional[str] = None) -> List[Position]:
+        key = (symbol or self.current_symbol_key()).strip().upper()
+        raw = self.positions_by_symbol.get(key, [])
+        if raw is None:
+            return []
+        if isinstance(raw, list):
+            return list(raw)
+        return [raw]
+
+    def total_open_positions(self) -> int:
+        total = 0
+        for value in self.positions_by_symbol.values():
+            if isinstance(value, list):
+                total += len(value)
+            elif value is not None:
+                total += 1
+        return total
+
     def current_position(self) -> Optional[Position]:
-        return self.positions_by_symbol.get(self.current_symbol_key())
+        positions = self.positions_for_symbol()
+        return positions[-1] if positions else None
+
+    def current_positions(self) -> List[Position]:
+        return self.positions_for_symbol()
 
     def set_current_position(self, pos: Optional[Position]):
         key = self.current_symbol_key()
         if pos is None:
             self.positions_by_symbol.pop(key, None)
         else:
-            self.positions_by_symbol[key] = pos
+            self.positions_by_symbol[key] = [pos]
+
+    def add_position(self, pos: Position):
+        key = pos.symbol.strip().upper()
+        current = self.positions_for_symbol(key)
+        current.append(pos)
+        self.positions_by_symbol[key] = current
+
+    def remove_position(self, pos: Position):
+        key = pos.symbol.strip().upper()
+        current = self.positions_for_symbol(key)
+        current = [item for item in current if item is not pos]
+        if current:
+            self.positions_by_symbol[key] = current
+        else:
+            self.positions_by_symbol.pop(key, None)
 
     def on_chart_loaded(self, ok: bool):
         self.chart_ready = ok
@@ -820,6 +1015,20 @@ class MainWindow(QMainWindow):
         else:
             vbar.setValue(min(old_v, vbar.maximum()))
 
+    def set_html_preserve_scroll(self, widget: QTextBrowser, html: str):
+        vbar = widget.verticalScrollBar()
+        old_v = vbar.value()
+        old_max = max(1, vbar.maximum())
+        ratio = float(old_v) / float(old_max)
+        at_bottom = old_v >= max(0, vbar.maximum() - 2)
+        widget.blockSignals(True)
+        widget.setHtml(html)
+        widget.blockSignals(False)
+        if at_bottom:
+            vbar.setValue(vbar.maximum())
+        else:
+            vbar.setValue(int(ratio * max(1, vbar.maximum())))
+
     def refresh_condition_button_texts(self):
         long_on = sum(1 for a in self.long_actions.values() if a.isChecked())
         short_on = sum(1 for a in self.short_actions.values() if a.isChecked())
@@ -836,8 +1045,19 @@ class MainWindow(QMainWindow):
         self.refresh_status_overview()
 
     def on_psych_param_changed(self):
-        self.refresh_psychology_tab()
-        self.refresh_trade_status_bar()
+        if self.df.empty:
+            self.refresh_psychology_tab()
+            self.refresh_trade_status_bar()
+            self.refresh_ai_bot_tab()
+            return
+        self.refresh_panels()
+
+    def on_runtime_param_changed(self):
+        if self.df.empty:
+            self.refresh_trade_status_bar()
+            self.refresh_ai_bot_tab()
+            return
+        self.refresh_panels()
 
     def status_value(self, text: str, prefix: str) -> str:
         needle = prefix + ":"
@@ -848,6 +1068,7 @@ class MainWindow(QMainWindow):
     def refresh_status_overview(self):
         status_val = self.status_value(self.lbl_status.text(), "Market stream live")
         auto_val = self.status_value(self.lbl_auto.text(), "Auto Trading")
+        ai_val = self.status_value(self.lbl_ai_bot.text(), "AI Bot")
         bal_val = self.status_value(self.lbl_balance.text(), "Total Balance")
         avail_val = self.status_value(self.lbl_available.text(), "Available Balance")
         eq_val = self.status_value(self.lbl_equity.text(), "Equity")
@@ -857,12 +1078,14 @@ class MainWindow(QMainWindow):
         score_val = self.status_value(self.lbl_score.text(), "Signal Score")
 
         auto_color = "#22c55e" if auto_val.upper() == "ON" else "#f97316"
+        ai_color = "#22c55e" if ai_val.upper() == "ON" else "#64748b"
         sig_color = "#22c55e" if "READY" in sig_val.upper() else "#fbbf24"
         pos_color = "#38bdf8" if "FLAT" not in pos_val.upper() else "#94a3b8"
 
         cards = [
             ("Market", status_val, "#60a5fa"),
             ("Auto", auto_val, auto_color),
+            ("AI Bot", ai_val, ai_color),
             ("Position", pos_val, pos_color),
             ("Total Balance", bal_val, "#34d399"),
             ("Available", avail_val, "#2dd4bf"),
@@ -940,6 +1163,11 @@ class MainWindow(QMainWindow):
 
         return params
 
+    def psych_limits_enabled(self) -> bool:
+        if hasattr(self, "psych_limits_toggle"):
+            return bool(self.psych_limits_toggle.isChecked())
+        return False
+
     def psych_float(self, params: Dict[str, Any], key: str, default: float) -> float:
         try:
             return float(params.get(key, default))
@@ -1002,18 +1230,26 @@ class MainWindow(QMainWindow):
         self.ensure_daily_stats_current(now)
 
         params = self.psychological_params()
-        pos = self.current_position()
+        psych_limits_on = self.psych_limits_enabled()
+        positions = self.current_positions()
+        pos = positions[-1] if positions else None
+        open_position_count = self.total_open_positions()
         long_state = self.selected_indicator_state("long", scored)
         short_state = self.selected_indicator_state("short", scored)
         live_roi = None
-        if pos is not None and not self.df.empty:
-            live_roi = self.current_live_roi_pct(
-                pos.side,
-                pos.entry_price,
-                float(self.df.iloc[-1]["close"]),
-                pos.leverage,
-                self.fee_rate(),
-            )
+        if positions and not self.df.empty:
+            current_price = float(self.df.iloc[-1]["close"])
+            roi_values = [
+                self.current_live_roi_pct(
+                    item.side,
+                    item.entry_price,
+                    current_price,
+                    item.leverage,
+                    self.fee_rate(),
+                )
+                for item in positions
+            ]
+            live_roi = float(sum(roi_values) / max(1, len(roi_values)))
 
         daily_base = max(1e-9, float(self.daily_start_balance))
         daily_loss_pct = max(0.0, (-self.daily_net_pnl / daily_base) * 100.0)
@@ -1043,103 +1279,118 @@ class MainWindow(QMainWindow):
             sl_pct = 0.0
 
         required_agree = max(0, self.psych_int(params, "require_indicators_agree", 2))
+
+        def gate_payload(pass_value: bool, detail: str, enforceable: bool = True) -> Dict[str, Any]:
+            if not enforceable:
+                return {"pass": bool(pass_value), "detail": detail, "enforced": False}
+            if not psych_limits_on:
+                return {
+                    "pass": True,
+                    "detail": f"{detail} (disabled)",
+                    "enforced": False,
+                    "raw_pass": bool(pass_value),
+                }
+            return {"pass": bool(pass_value), "detail": detail, "enforced": True}
+
         gates = {
-            "max_loss_per_trade_pct": {
-                "pass": sl_pct <= self.psych_float(params, "max_loss_per_trade_pct", 1.5),
-                "detail": (
+            "max_loss_per_trade_pct": gate_payload(
+                sl_pct <= self.psych_float(params, "max_loss_per_trade_pct", 1.5),
+                (
                     f"max_loss_per_trade_pct exceeded "
                     f"({sl_pct:.2f}% configured vs {self.psych_float(params, 'max_loss_per_trade_pct', 1.5):.2f}% limit)"
                 ),
-            },
-            "daily_loss_limit_pct": {
-                "pass": daily_loss_pct < self.psych_float(params, "daily_loss_limit_pct", 4.0),
-                "detail": (
+            ),
+            "daily_loss_limit_pct": gate_payload(
+                daily_loss_pct < self.psych_float(params, "daily_loss_limit_pct", 4.0),
+                (
                     f"daily_loss_limit_pct hit "
                     f"({daily_loss_pct:.2f}% today vs {self.psych_float(params, 'daily_loss_limit_pct', 4.0):.2f}% limit)"
                 ),
-            },
-            "drawdown_circuit_breaker_pct": {
-                "pass": drawdown_pct < self.psych_float(params, "drawdown_circuit_breaker_pct", 10.0),
-                "detail": (
+            ),
+            "drawdown_circuit_breaker_pct": gate_payload(
+                drawdown_pct < self.psych_float(params, "drawdown_circuit_breaker_pct", 10.0),
+                (
                     f"drawdown_circuit_breaker_pct hit "
                     f"({drawdown_pct:.2f}% drawdown vs {self.psych_float(params, 'drawdown_circuit_breaker_pct', 10.0):.2f}% limit)"
                 ),
-            },
-            "max_consecutive_losses": {
-                "pass": self.consecutive_losses < self.psych_int(params, "max_consecutive_losses", 3),
-                "detail": (
+            ),
+            "max_consecutive_losses": gate_payload(
+                self.consecutive_losses < self.psych_int(params, "max_consecutive_losses", 3),
+                (
                     f"max_consecutive_losses hit "
                     f"({self.consecutive_losses} losses vs {self.psych_int(params, 'max_consecutive_losses', 3)} limit)"
                 ),
-            },
-            "post_loss_cooldown_min": {
-                "pass": cooldown_remaining_min <= 0.0,
-                "detail": (
+            ),
+            "post_loss_cooldown_min": gate_payload(
+                cooldown_remaining_min <= 0.0,
+                (
                     f"post_loss_cooldown_min active "
                     f"({cooldown_remaining_min:.1f} min remaining)"
                 ),
-            },
-            "profit_taking_threshold_pct": {
-                "pass": True,
-                "detail": (
+            ),
+            "profit_taking_threshold_pct": gate_payload(
+                True,
+                (
                     f"profit_taking_threshold_pct tracking "
                     f"({0.0 if live_roi is None else live_roi:.2f}% live ROI vs "
                     f"{self.psych_float(params, 'profit_taking_threshold_pct', 3.0):.2f}% threshold)"
                 ),
-                "enforced": False,
-            },
-            "trailing_stop_pct": {
-                "pass": True,
-                "detail": (
+                enforceable=False,
+            ),
+            "trailing_stop_pct": gate_payload(
+                True,
+                (
                     f"trailing_stop_pct tracking "
                     f"({self.psych_float(params, 'trailing_stop_pct', 1.0):.2f}% trailing distance configured)"
                 ),
-                "enforced": False,
-            },
-            "max_open_positions": {
-                "pass": len(self.positions_by_symbol) < self.psych_int(params, "max_open_positions", 3),
-                "detail": (
+                enforceable=False,
+            ),
+            "max_open_positions": gate_payload(
+                open_position_count < self.psych_int(params, "max_open_positions", 3),
+                (
                     f"max_open_positions reached "
-                    f"({len(self.positions_by_symbol)} open vs {self.psych_int(params, 'max_open_positions', 3)} limit)"
+                    f"({open_position_count} open vs {self.psych_int(params, 'max_open_positions', 3)} limit)"
                 ),
-            },
-            "signal_age_limit_sec": {
-                "pass": signal_age_sec is None or signal_age_sec <= self.psych_float(params, "signal_age_limit_sec", 60.0),
-                "detail": (
+            ),
+            "signal_age_limit_sec": gate_payload(
+                signal_age_sec is None or signal_age_sec <= self.psych_float(params, "signal_age_limit_sec", 60.0),
+                (
                     f"signal_age_limit_sec exceeded "
                     f"({0.0 if signal_age_sec is None else signal_age_sec:.1f}s vs {self.psych_float(params, 'signal_age_limit_sec', 60.0):.1f}s limit)"
                 ),
-            },
-            "trade_cap_per_day": {
-                "pass": self.daily_trade_count < self.psych_int(params, "trade_cap_per_day", 10),
-                "detail": (
+            ),
+            "trade_cap_per_day": gate_payload(
+                self.daily_trade_count < self.psych_int(params, "trade_cap_per_day", 10),
+                (
                     f"trade_cap_per_day reached "
                     f"({self.daily_trade_count} trades vs {self.psych_int(params, 'trade_cap_per_day', 10)} limit)"
                 ),
-            },
-            "news_blackout_minutes": {
-                "pass": True,
-                "detail": (
+            ),
+            "news_blackout_minutes": gate_payload(
+                True,
+                (
                     f"news_blackout_minutes monitor only "
                     f"({self.psych_int(params, 'news_blackout_minutes', 15)} min, no news feed connected)"
                 ),
-                "enforced": False,
-            },
+                enforceable=False,
+            ),
         }
 
         sides = {
             "long": {
                 **long_state,
-                "indicator_gate_pass": long_state["agree_count"] >= required_agree,
+                "indicator_gate_pass": (not psych_limits_on) or (long_state["agree_count"] >= required_agree),
                 "indicator_detail": (
                     f"require_indicators_agree needs {required_agree}, current long agree={long_state['agree_count']}"
+                    + ("" if psych_limits_on else " (disabled)")
                 ),
             },
             "short": {
                 **short_state,
-                "indicator_gate_pass": short_state["agree_count"] >= required_agree,
+                "indicator_gate_pass": (not psych_limits_on) or (short_state["agree_count"] >= required_agree),
                 "indicator_detail": (
                     f"require_indicators_agree needs {required_agree}, current short agree={short_state['agree_count']}"
+                    + ("" if psych_limits_on else " (disabled)")
                 ),
             },
         }
@@ -1147,7 +1398,8 @@ class MainWindow(QMainWindow):
         return {
             "now": str(now),
             "auto_enabled": self.auto_enabled,
-            "position_live": pos is not None,
+            "psych_limits_enabled": psych_limits_on,
+            "position_live": open_position_count > 0,
             "live_roi": live_roi,
             "daily_trade_count": self.daily_trade_count,
             "daily_net_pnl": self.daily_net_pnl,
@@ -1157,7 +1409,7 @@ class MainWindow(QMainWindow):
             "session_peak_balance": self.session_peak_balance,
             "consecutive_losses": self.consecutive_losses,
             "cooldown_remaining_min": cooldown_remaining_min,
-            "open_positions": len(self.positions_by_symbol),
+            "open_positions": open_position_count,
             "signal_age_sec": signal_age_sec,
             "gates": gates,
             "sides": sides,
@@ -1175,7 +1427,7 @@ class MainWindow(QMainWindow):
         blockers: List[str] = []
         if include_auto_state and not self.auto_enabled:
             blockers.append("auto trading OFF")
-        if include_position_state and self.current_position() is not None:
+        if include_position_state and self.total_open_positions() > 0:
             blockers.append("trade already live")
         if self.capital_per_trade() > self.available_balance:
             blockers.append(
@@ -1215,20 +1467,21 @@ class MainWindow(QMainWindow):
 
     def build_trade_status_payload(self, scored: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
         pos = self.current_position()
+        open_count = self.total_open_positions()
         if pos is not None:
             return {
                 "state": "LIVE",
-                "summary": f"{pos.side.upper()} | {pos.source.upper()} | Entry {pos.entry_price:.4f} | Bars {pos.bars_held}",
+                "summary": f"{open_count} live trade(s) | Last {pos.side.upper()} | {pos.source.upper()} | Entry {pos.entry_price:.4f} | Bars {pos.bars_held}",
                 "scores": None,
                 "global_blockers": [],
                 "long_blockers": [],
                 "short_blockers": [],
             }
 
-        if not self.auto_enabled:
+        if not self.auto_enabled and not self.ai_enabled:
             return {
                 "state": "IDLE",
-                "summary": "Auto trading OFF",
+                "summary": "Auto trading OFF | AI Bot OFF",
                 "scores": None,
                 "global_blockers": [],
                 "long_blockers": ["auto trading OFF"],
@@ -1258,6 +1511,24 @@ class MainWindow(QMainWindow):
             }
 
         evaluation = self.evaluate_psychology(scored)
+        if self.ai_enabled:
+            ai_decision = self.build_ai_decision(scored, evaluation)
+            state_map = {
+                "READY": "READY",
+                "WAIT": "BLOCKED",
+                "WAITING": "WAITING",
+            }
+            return {
+                "state": state_map.get(ai_decision.get("state", "WAITING"), "WAITING"),
+                "summary": ai_decision.get("summary", "AI Bot evaluating"),
+                "scores": {
+                    "long": ai_decision.get("long_ai_score", 0.0),
+                    "short": ai_decision.get("short_ai_score", 0.0),
+                },
+                "global_blockers": ai_decision.get("blockers", []),
+                "long_blockers": [] if ai_decision.get("side") == "long" else ai_decision.get("blockers", []),
+                "short_blockers": [] if ai_decision.get("side") == "short" else ai_decision.get("blockers", []),
+            }
         global_blockers = self.unique_reasons([
             gate["detail"]
             for gate in evaluation["gates"].values()
@@ -1280,7 +1551,8 @@ class MainWindow(QMainWindow):
                 ready_parts.append(f"LONG {scored.get('long_score_user', scored['long_score']):.2f}")
             if short_ready:
                 ready_parts.append(f"SHORT {scored.get('short_score_user', scored['short_score']):.2f}")
-            summary = "Ready: " + ", ".join(ready_parts)
+            engine = "AI" if self.ai_enabled else "AUTO"
+            summary = f"{engine} Ready: " + ", ".join(ready_parts)
             return {
                 "state": "READY",
                 "summary": summary,
@@ -1296,7 +1568,7 @@ class MainWindow(QMainWindow):
         return {
             "state": "BLOCKED",
             "summary": (
-                f"Not activated | "
+                f"{'AI' if self.ai_enabled else 'AUTO'} waiting | "
                 f"L={scored.get('long_score_user', scored['long_score']):.2f} "
                 f"S={scored.get('short_score_user', scored['short_score']):.2f}"
             ),
@@ -1400,8 +1672,10 @@ class MainWindow(QMainWindow):
         short_agree = evaluation["sides"]["short"]["agree_count"]
 
         gates = evaluation["gates"]
-        gate_state = lambda key: "PASS" if gates[key]["pass"] else "BLOCK"
+        gate_state = lambda key: ("OFF" if not gates[key].get("enforced", True) else ("PASS" if gates[key]["pass"] else "BLOCK"))
         signal_age = evaluation["signal_age_sec"]
+        limits_state = "ON" if evaluation.get("psych_limits_enabled") else "OFF"
+        limits_state_color = "#22c55e" if limits_state == "ON" else "#94a3b8"
         rows = [
             ("max_loss_per_trade_pct", f"Limit {max_loss_limit:.2f}% | Current SL {current_sl:.2f}%", gate_state("max_loss_per_trade_pct")),
             ("daily_loss_limit_pct", f"Limit {daily_loss_limit:.2f}% | Current {evaluation['daily_loss_pct']:.2f}%", gate_state("daily_loss_limit_pct")),
@@ -1412,7 +1686,7 @@ class MainWindow(QMainWindow):
             ("trailing_stop_pct", f"Trailing {trailing_stop:.2f}% | Armed {str(profit_reached)}", "INFO"),
             ("max_open_positions", f"Limit {max_positions} | Current {evaluation['open_positions']}", gate_state("max_open_positions")),
             ("signal_age_limit_sec", f"Limit {signal_age_limit:.1f}s | Current {fmt_val(signal_age) if signal_age is not None else 'NA'}s", gate_state("signal_age_limit_sec")),
-            ("require_indicators_agree", f"Need {require_agree} | Long {long_agree} | Short {short_agree}", "PASS" if (long_agree >= require_agree and short_agree >= require_agree) else "BLOCK"),
+            ("require_indicators_agree", f"Need {require_agree} | Long {long_agree} | Short {short_agree}", ("OFF" if not evaluation.get("psych_limits_enabled") else ("PASS" if (long_agree >= require_agree and short_agree >= require_agree) else "BLOCK"))),
             ("trade_cap_per_day", f"Limit {trade_cap_limit} | Current {evaluation['daily_trade_count']}", gate_state("trade_cap_per_day")),
             ("news_blackout_minutes", f"Setting {news_blackout}m | News feed not connected", "INFO"),
         ]
@@ -1421,10 +1695,12 @@ class MainWindow(QMainWindow):
             "PASS": ("#052e16", "#4ade80"),
             "BLOCK": ("#450a0a", "#fca5a5"),
             "INFO": ("#1e293b", "#93c5fd"),
+            "OFF": ("#1f2937", "#cbd5e1"),
         }
 
         html = [
             "<h3 style='color:#93c5fd; margin:0 0 8px 0;'>Psychology Evaluation</h3>",
+            f"<div style='margin:0 0 8px 0; color:{limits_state_color}; font-weight:700;'>Psychological Limits: {limits_state}</div>",
             "<table width='100%' cellspacing='6' cellpadding='0'>",
         ]
         for key, details, status in rows:
@@ -1463,10 +1739,12 @@ class MainWindow(QMainWindow):
         short_score = scored.get("short_score_user", scored.get("short_score", 0.0))
         long_ready = scored.get("long_ready_user", False)
         short_ready = scored.get("short_ready_user", False)
+        ai_decision = self.build_ai_decision(scored)
 
         html = [
             f"<h3 style='color:#93c5fd; margin:0 0 10px 0;'>Strategy Run Result</h3>",
-            f"<div style='color:#c7d2fe; margin-bottom:6px;'>Bot Type: <strong>{escape(self.bot_type.currentText())}</strong></div>",
+            f"<div style='color:#c7d2fe; margin-bottom:6px;'>AI Nature: <strong>{escape(self.ai_mode.currentText())}</strong></div>",
+            f"<div style='color:#f59e0b; margin-bottom:6px;'>AI View: <strong>{escape(ai_decision.get('summary', 'Waiting'))}</strong></div>",
             f"<div style='color:#e2e8f0; margin-bottom:8px;'>Long Score: <strong>{long_score:.2f}</strong> | Short Score: <strong>{short_score:.2f}</strong></div>",
             f"<div style='color:#38bdf8; margin-bottom:12px;'>Long Ready: <strong>{'YES' if long_ready else 'NO'}</strong> | Short Ready: <strong>{'YES' if short_ready else 'NO'}</strong></div>",
             "<table width='100%' cellspacing='6' cellpadding='0'>",
@@ -1491,6 +1769,483 @@ class MainWindow(QMainWindow):
 
         html.extend(["</td></tr></table>"])
         self.txt_strategy_report.setHtml("".join(html))
+
+    def current_ai_profile(self) -> Dict[str, Any]:
+        ai_nature = self.ai_mode.currentText().strip().lower() if hasattr(self, "ai_mode") else "optimal"
+        profile = {
+            "name": "AI Fusion",
+            "threshold": max(58.0, self.min_score_val()),
+            "min_edge": 5.0,
+            "long_focus": [
+                "EMA20 > EMA50",
+                "EMA50 > EMA200",
+                "MACD Cross Up",
+                "RSI > 55",
+                "Vol Spike",
+                "Bullish VSA",
+                "No Supply Confirm",
+                "Shakeout Confirm",
+                "MACD Hist > 0",
+                "Above VRVP POC",
+                "Above Session POC",
+                "Agg Delta Bullish",
+                "Book Bid Dominant",
+            ],
+            "short_focus": [
+                "EMA20 < EMA50",
+                "EMA50 < EMA200",
+                "MACD Cross Down",
+                "RSI < 45",
+                "Vol Spike",
+                "Bearish VSA",
+                "No Demand Confirm",
+                "Upthrust Confirm",
+                "MACD Hist < 0",
+                "Below VRVP POC",
+                "Below Session POC",
+                "Agg Delta Bearish",
+                "Book Ask Dominant",
+            ],
+        }
+        if ai_nature == "aggressive":
+            profile.update({
+                "nature": "Aggressive",
+                "threshold": max(46.0, profile["threshold"] - 10.0),
+                "min_edge": max(2.0, profile["min_edge"] - 2.0),
+                "ladder_count": 3,
+                "spacing_mult": 0.45,
+                "capital_split": 0.90,
+                "max_same_symbol_positions": 3,
+            })
+        else:
+            profile.update({
+                "nature": "Optimal",
+                "threshold": profile["threshold"],
+                "min_edge": profile["min_edge"],
+                "ladder_count": 2,
+                "spacing_mult": 0.70,
+                "capital_split": 0.70,
+                "max_same_symbol_positions": 2,
+            })
+        return profile
+
+    def ai_blockers_for_side(
+        self,
+        side: str,
+        scored: Optional[Dict[str, Any]] = None,
+        evaluation: Optional[Dict[str, Any]] = None,
+    ) -> List[str]:
+        blockers: List[str] = []
+        profile = self.current_ai_profile()
+        same_symbol_positions = len(self.current_positions())
+        if same_symbol_positions >= int(profile.get("max_same_symbol_positions", 2)):
+            blockers.append(
+                f"AI basket full ({same_symbol_positions}/{int(profile.get('max_same_symbol_positions', 2))})"
+            )
+        if self.capital_per_trade() > self.available_balance:
+            blockers.append(
+                f"capital/trade {self.capital_per_trade():.2f} exceeds available {self.available_balance:.2f}"
+            )
+        if scored is None:
+            blockers.append("waiting for more candles")
+            return blockers
+
+        if evaluation is None:
+            evaluation = self.evaluate_psychology(scored)
+
+        for gate in evaluation["gates"].values():
+            if gate.get("enforced", True) and not gate["pass"]:
+                blockers.append(gate["detail"])
+
+        params = evaluation.get("params", {})
+        required_agree = max(0, self.psych_int(params, "require_indicators_agree", 2))
+        checks = scored["long_checks"] if side == "long" else scored["short_checks"]
+        raw_agree = sum(1 for ok in checks.values() if ok)
+        if raw_agree < required_agree:
+            blockers.append(f"AI agreement below threshold ({raw_agree}/{required_agree})")
+
+        return self.unique_reasons(blockers)
+
+    def build_ai_decision(self, scored: Optional[Dict[str, Any]] = None, evaluation: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+        profile = self.current_ai_profile()
+        if scored is None:
+            scored = self.score_current_row()
+        if scored is None or len(self.df) < 220:
+            return {
+                "state": "WAITING",
+                "summary": "Waiting for enough candles to let AI evaluate the market",
+                "side": None,
+                "confidence": 0.0,
+                "long_ai_score": 0.0,
+                "short_ai_score": 0.0,
+                "reasons": [],
+                "blockers": ["waiting for more candles"],
+                "profile": profile["name"],
+                "nature": profile.get("nature", "Optimal"),
+                "limits": [],
+            }
+
+        if evaluation is None:
+            evaluation = self.evaluate_psychology(scored)
+
+        row = self.df.iloc[-1]
+        long_focus_hits = [k for k in profile["long_focus"] if scored["long_checks"].get(k, False)]
+        short_focus_hits = [k for k in profile["short_focus"] if scored["short_checks"].get(k, False)]
+        long_focus_boost = len(long_focus_hits) * 3.0
+        short_focus_boost = len(short_focus_hits) * 3.0
+
+        long_ai_score = min(
+            100.0,
+            (0.60 * scored.get("long_score", 0.0))
+            + (0.25 * (100.0 * sum(1 for ok in scored["long_checks"].values() if ok) / max(1, len(scored["long_checks"])) ))
+            + (0.15 * min(100.0, max(0.0, float(row.get("rsi14", 50.0)) + 10.0)))
+            + long_focus_boost,
+        )
+        short_ai_score = min(
+            100.0,
+            (0.60 * scored.get("short_score", 0.0))
+            + (0.25 * (100.0 * sum(1 for ok in scored["short_checks"].values() if ok) / max(1, len(scored["short_checks"])) ))
+            + (0.15 * min(100.0, max(0.0, 110.0 - float(row.get("rsi14", 50.0)))))
+            + short_focus_boost,
+        )
+
+        edge = abs(long_ai_score - short_ai_score)
+        preferred_side = "long" if long_ai_score >= short_ai_score else "short"
+        preferred_score = long_ai_score if preferred_side == "long" else short_ai_score
+        preferred_reasons = long_focus_hits if preferred_side == "long" else short_focus_hits
+        blockers = self.ai_blockers_for_side(preferred_side, scored, evaluation)
+        atr_val = float(row["atr14"]) if pd.notna(row["atr14"]) else max(1e-9, float(row["close"]) * 0.003)
+        base_price = float(row["close"])
+        ladder_count = int(profile.get("ladder_count", 2))
+        spacing_mult = float(profile.get("spacing_mult", 0.7))
+        limits = []
+        for idx in range(ladder_count):
+            distance = atr_val * spacing_mult * float(idx + 1)
+            trigger_price = base_price - distance if preferred_side == "long" else base_price + distance
+            limits.append(round(trigger_price, 4))
+
+        if preferred_score >= profile["threshold"] and edge >= profile["min_edge"] and not blockers:
+            return {
+                "state": "READY",
+                "summary": f"AI wants {preferred_side.upper()} based on live data and {profile['name']}",
+                "side": preferred_side,
+                "confidence": round(preferred_score, 2),
+                "long_ai_score": round(long_ai_score, 2),
+                "short_ai_score": round(short_ai_score, 2),
+                "reasons": preferred_reasons or (
+                    scored.get("long_reasons", [])[:4] if preferred_side == "long" else scored.get("short_reasons", [])[:4]
+                ),
+                "blockers": [],
+                "profile": profile["name"],
+                "nature": profile.get("nature", "Optimal"),
+                "limits": limits,
+            }
+
+        reasons = preferred_reasons or (
+            scored.get("long_reasons", [])[:4] if preferred_side == "long" else scored.get("short_reasons", [])[:4]
+        )
+        summary = (
+            f"AI is staying flat. Best side: {preferred_side.upper()} | "
+            f"confidence {preferred_score:.2f} | edge {edge:.2f}"
+        )
+        return {
+            "state": "WAIT",
+            "summary": summary,
+            "side": preferred_side if preferred_score > 0 else None,
+            "confidence": round(preferred_score, 2),
+            "long_ai_score": round(long_ai_score, 2),
+            "short_ai_score": round(short_ai_score, 2),
+            "reasons": reasons,
+            "blockers": blockers if blockers else [f"AI threshold not met ({preferred_score:.2f}/{profile['threshold']:.2f})"],
+            "profile": profile["name"],
+            "nature": profile.get("nature", "Optimal"),
+            "limits": limits,
+        }
+
+    def refresh_ai_scan_table(self):
+        if not hasattr(self, "tbl_ai_scan"):
+            return
+
+        rows = list(self.ai_stats.get("last_scan_rows", []))
+        signature = "|".join(
+            f"{row.get('symbol','')}:{row.get('change_pct',0)}:{row.get('last_price',0)}:{row.get('quote_volume',0)}"
+            for row in rows
+        )
+        if signature == self.ai_scan_rows_signature:
+            return
+        self.ai_scan_rows_signature = signature
+
+        vbar = self.tbl_ai_scan.verticalScrollBar()
+        hbar = self.tbl_ai_scan.horizontalScrollBar()
+        old_v = vbar.value()
+        old_h = hbar.value()
+
+        self.tbl_ai_scan.setRowCount(len(rows))
+        for r, row in enumerate(rows):
+            values = [
+                str(row.get("symbol", "")),
+                f"{float(row.get('change_pct', 0.0)):.2f}",
+                f"{float(row.get('last_price', 0.0)):.6f}",
+                f"{float(row.get('quote_volume', 0.0)):.2f}",
+                "Momentum",
+            ]
+            for c, value in enumerate(values):
+                item = QTableWidgetItem(value)
+                if c in (1, 2, 3):
+                    item.setTextAlignment(Qt.AlignRight | Qt.AlignVCenter)
+                if c == 0:
+                    item.setForeground(QBrush(QColor("#22d3ee")))
+                if c == 1:
+                    change = float(row.get("change_pct", 0.0))
+                    item.setForeground(QBrush(QColor("#22c55e" if change >= 5 else "#facc15")))
+                self.tbl_ai_scan.setItem(r, c, item)
+
+        vbar.setValue(min(old_v, vbar.maximum()))
+        hbar.setValue(min(old_h, hbar.maximum()))
+
+    def refresh_ai_bot_tab(self, scored: Optional[Dict[str, Any]] = None):
+        if not hasattr(self, "txt_ai_overview"):
+            return
+
+        decision = self.build_ai_decision(scored)
+        self.latest_ai_decision = decision
+        status_colors = {
+            "READY": ("#052e16", "#4ade80"),
+            "WAIT": ("#3f1d0c", "#fdba74"),
+            "WAITING": ("#1e293b", "#93c5fd"),
+        }
+        bg, fg = status_colors.get(decision["state"], ("#1e293b", "#93c5fd"))
+
+        reasons_html = "".join(
+            f"<div style='color:#e2e8f0; margin-bottom:3px;'>- {escape(str(reason))}</div>"
+            for reason in decision.get("reasons", [])[:6]
+        ) or "<div style='color:#94a3b8;'>No strong drivers yet.</div>"
+        limits_html = "".join(
+            f"<div style='color:#e2e8f0; margin-bottom:3px;'>- Limit {idx + 1}: {float(level):.4f}</div>"
+            for idx, level in enumerate(decision.get("limits", [])[:6])
+        ) or "<div style='color:#94a3b8;'>No AI limits prepared yet.</div>"
+        blockers_html = "".join(
+            f"<div style='color:#fca5a5; margin-bottom:3px;'>- {escape(str(reason))}</div>"
+            for reason in decision.get("blockers", [])[:6]
+        ) or "<div style='color:#86efac;'>No active AI blockers.</div>"
+
+        html = [
+            "<h3 style='color:#93c5fd; margin:0 0 10px 0;'>AI Bot Decision Center</h3>",
+            f"<div style='margin-bottom:8px; color:#c7d2fe;'>Engine: <strong>{escape(decision.get('profile', 'AI Fusion'))}</strong> | Nature: <strong>{escape(decision.get('nature', self.ai_mode.currentText()))}</strong></div>",
+            f"<div style='margin-bottom:10px;'><span style='background:{bg}; color:{fg}; padding:4px 12px; border-radius:999px; font-weight:800;'>{escape(decision['state'])}</span> <span style='color:#f8fafc; font-weight:700; margin-left:8px;'>{escape(decision['summary'])}</span></div>",
+            "<table width='100%' cellspacing='6' cellpadding='0'>",
+            "<tr>",
+            f"<td style='background:#111827; border:1px solid #334155; border-radius:8px; padding:8px;'><div style='color:#22d3ee; font-size:12px; font-weight:700;'>AI Long Score</div><div style='font-size:18px; color:#e2e8f0;'>{decision['long_ai_score']:.2f}</div></td>",
+            f"<td style='background:#111827; border:1px solid #334155; border-radius:8px; padding:8px;'><div style='color:#c084fc; font-size:12px; font-weight:700;'>AI Short Score</div><div style='font-size:18px; color:#e2e8f0;'>{decision['short_ai_score']:.2f}</div></td>",
+            f"<td style='background:#111827; border:1px solid #334155; border-radius:8px; padding:8px;'><div style='color:#f59e0b; font-size:12px; font-weight:700;'>Confidence</div><div style='font-size:18px; color:#e2e8f0;'>{decision['confidence']:.2f}</div></td>",
+            "</tr>",
+            "<tr>",
+            f"<td style='background:#111827; border:1px solid #334155; border-radius:8px; padding:8px;'><div style='color:#60a5fa; font-size:12px; font-weight:700;'>Markets Scanned</div><div style='font-size:18px; color:#e2e8f0;'>{int(self.ai_stats['markets_scanned'])}</div></td>",
+            f"<td style='background:#111827; border:1px solid #334155; border-radius:8px; padding:8px;'><div style='color:#34d399; font-size:12px; font-weight:700;'>AI Trades Opened</div><div style='font-size:18px; color:#e2e8f0;'>{int(self.ai_stats['ai_trades_opened'])}</div></td>",
+            f"<td style='background:#111827; border:1px solid #334155; border-radius:8px; padding:8px;'><div style='color:#f87171; font-size:12px; font-weight:700;'>AI Trades Closed</div><div style='font-size:18px; color:#e2e8f0;'>{int(self.ai_stats['ai_trades_closed'])}</div></td>",
+            "</tr>",
+            "</table>",
+            "<table width='100%' cellspacing='6' cellpadding='0' style='margin-top:8px;'>",
+            "<tr>",
+            f"<td width='50%' style='background:#0b1731; border:1px solid #334155; border-radius:8px; padding:10px; vertical-align:top;'><div style='color:#22d3ee; font-weight:700; margin-bottom:6px;'>Why AI Likes the Setup</div>{reasons_html}</td>",
+            f"<td width='50%' style='background:#1f172a; border:1px solid #334155; border-radius:8px; padding:10px; vertical-align:top;'><div style='color:#fda4af; font-weight:700; margin-bottom:6px;'>Why AI Is Waiting / Blocking</div>{blockers_html}</td>",
+            "</tr>",
+            "<tr>",
+            f"<td colspan='2' style='background:#111827; border:1px solid #334155; border-radius:8px; padding:10px; vertical-align:top;'><div style='color:#fbbf24; font-weight:700; margin-bottom:6px;'>AI Trigger Limits</div>{limits_html}</td>",
+            "</tr>",
+            "</table>",
+            f"<div style='margin-top:8px; color:#94a3b8;'>Scanner runs: {int(self.ai_stats['scans_run'])} | Opportunities found: {int(self.ai_stats['opportunities_found'])} | Exited before dip/rip: {int(self.ai_stats['exited_before_dip'])} | Basket trades live: {len(self.current_positions())} | Pending AI limits: {len(self.ai_pending_entries)} | Last scan: {escape(str(self.ai_stats.get('last_scan_time') or 'none'))}</div>",
+        ]
+        html_text = "".join(html)
+        if html_text != self.ai_overview_html_cache:
+            self.ai_overview_html_cache = html_text
+            self.set_html_preserve_scroll(self.txt_ai_overview, html_text)
+        self.lbl_ai_scan_status.setText(f"Scanner: {self.ai_stats.get('status_msg', 'idle')}")
+        self.refresh_ai_scan_table()
+
+    def run_ai_scan(self):
+        if self.ai_scanner_worker is not None and self.ai_scanner_worker.isRunning():
+            self.ai_stats["status_msg"] = "scan already running"
+            self.refresh_ai_bot_tab()
+            return
+
+        try:
+            min_up = max(0.1, float(self.ai_min_move.text().strip()))
+        except Exception:
+            min_up = 3.0
+            self.ai_min_move.setText("3.0")
+
+        try:
+            top_n = max(1, min(50, int(float(self.ai_top_n.text().strip()))))
+        except Exception:
+            top_n = 8
+            self.ai_top_n.setText("8")
+
+        self.ai_stats["status_msg"] = f"running scan (+{min_up:.1f}% | top {top_n})"
+        self.refresh_ai_bot_tab()
+        self.btn_ai_scan.setEnabled(False)
+
+        self.ai_scanner_worker = AIScannerWorker(min_up, top_n)
+        self.ai_scanner_worker.data_ready.connect(self.on_ai_scan_ready)
+        self.ai_scanner_worker.error.connect(self.on_ai_scan_error)
+        self.ai_scanner_worker.finished.connect(lambda: self.btn_ai_scan.setEnabled(True))
+        self.ai_scanner_worker.start()
+
+    def on_ai_scan_ready(self, payload: Dict[str, Any]):
+        self.ai_stats["scans_run"] += 1
+        self.ai_stats["markets_scanned"] += int(payload.get("scanned_count", 0))
+        self.ai_stats["opportunities_found"] += int(payload.get("spotted_total", 0))
+        self.ai_stats["last_scan_time"] = payload.get("scan_time")
+        self.ai_stats["last_scan_rows"] = list(payload.get("spotted", []))
+        self.ai_stats["last_min_up_pct"] = float(payload.get("min_up_pct", 3.0))
+        self.ai_stats["status_msg"] = (
+            f"scan complete: {payload.get('scanned_count', 0)} scanned, "
+            f"{payload.get('spotted_total', 0)} found"
+        )
+        self.apply_ai_selected_symbol(payload)
+        self.refresh_ai_bot_tab()
+
+    def ensure_symbol_in_combo(self, symbol: str):
+        symbol = symbol.strip().upper()
+        if not symbol:
+            return
+        existing = [self.symbol.itemText(i).strip().upper() for i in range(self.symbol.count())]
+        if symbol not in existing:
+            self.symbol.addItem(symbol)
+
+    def apply_ai_selected_symbol(self, payload: Dict[str, Any]):
+        if not self.ai_enabled:
+            return
+        if self.total_open_positions() > 0:
+            return
+        rows = list(payload.get("spotted", []))
+        if not rows:
+            return
+        chosen_symbol = str(rows[0].get("symbol", "")).strip().upper()
+        if not chosen_symbol:
+            return
+
+        self.ensure_symbol_in_combo(chosen_symbol)
+        if self.current_symbol_key() != chosen_symbol:
+            self.symbol.setCurrentText(chosen_symbol)
+            self.lbl_status.setText(f"AI Bot selected chart: {chosen_symbol}")
+            self.restart_market()
+        else:
+            self.lbl_status.setText(f"AI Bot confirmed current chart: {chosen_symbol}")
+
+    def on_ai_scan_error(self, message: str):
+        self.ai_stats["status_msg"] = f"scan failed"
+        self.api_details_display.setPlainText(message)
+        self.refresh_ai_bot_tab()
+
+    def process_pending_exit_watch(self, row: pd.Series):
+        if not self.pending_exit_watch:
+            return
+
+        remaining: List[Dict[str, Any]] = []
+        low = float(row["low"])
+        high = float(row["high"])
+        for watch in self.pending_exit_watch:
+            side = str(watch.get("side", "")).lower()
+            exit_price = float(watch.get("exit_price", 0.0))
+            trigger_pct = float(watch.get("trigger_pct", 0.15)) / 100.0
+            bars_left = int(watch.get("bars_left", 0))
+
+            hit = False
+            if side == "long":
+                hit = low <= exit_price * (1.0 - trigger_pct)
+            elif side == "short":
+                hit = high >= exit_price * (1.0 + trigger_pct)
+
+            if hit:
+                self.ai_stats["exited_before_dip"] += 1
+                continue
+
+            bars_left -= 1
+            if bars_left > 0:
+                watch["bars_left"] = bars_left
+                remaining.append(watch)
+
+        self.pending_exit_watch = remaining
+
+    def rebuild_ai_pending_entries(self, decision: Dict[str, Any], row: pd.Series):
+        side = decision.get("side")
+        limits = list(decision.get("limits", []))
+        if side not in {"long", "short"} or not limits:
+            self.ai_pending_entries = []
+            return
+
+        profile = self.current_ai_profile()
+        plan_signature = f"{side}|{','.join(f'{float(x):.4f}' for x in limits)}|{profile.get('nature', 'Optimal')}"
+        current_signature = ""
+        if self.ai_pending_entries:
+            current_signature = str(self.ai_pending_entries[0].get("plan_signature", ""))
+        if current_signature == plan_signature:
+            return
+
+        self.ai_plan_counter += 1
+        capital_fraction = float(profile.get("capital_split", 0.85))
+        ladder_count = max(1, len(limits))
+        per_trade_capital = max(1.0, self.capital_per_trade() * capital_fraction / ladder_count)
+
+        entries: List[Dict[str, Any]] = []
+        for idx, level in enumerate(limits):
+            entries.append({
+                "plan_id": self.ai_plan_counter,
+                "plan_signature": plan_signature,
+                "symbol": self.current_symbol_key(),
+                "side": side,
+                "trigger_price": float(level),
+                "capital_override": per_trade_capital,
+                "score": float(decision.get("confidence", 0.0)),
+                "state": "armed",
+                "label": f"AI {side.upper()} L{idx + 1}",
+            })
+        self.ai_pending_entries = entries
+
+    def process_ai_limit_entries(self, row: pd.Series, scored: Optional[Dict[str, Any]] = None):
+        if not self.ai_pending_entries or self.df.empty:
+            return
+
+        low_price = float(row["low"])
+        high_price = float(row["high"])
+        remaining: List[Dict[str, Any]] = []
+        same_symbol_live = len(self.current_positions())
+        max_same_symbol_positions = int(self.current_ai_profile().get("max_same_symbol_positions", 2))
+
+        for plan in self.ai_pending_entries:
+            if same_symbol_live >= max_same_symbol_positions:
+                remaining.append(plan)
+                continue
+
+            side = str(plan.get("side", "")).lower()
+            trigger_price = float(plan.get("trigger_price", 0.0))
+            touched = (
+                low_price <= trigger_price if side == "long"
+                else high_price >= trigger_price if side == "short"
+                else False
+            )
+            if not touched:
+                remaining.append(plan)
+                continue
+
+            capital_backup = self.capital_trade.text()
+            try:
+                self.capital_trade.setText(f"{float(plan.get('capital_override', self.capital_per_trade())):.4f}")
+                snapshot = self.get_ai_entry_snapshot(side, scored)
+                self.enter_position(
+                    side,
+                    trigger_price,
+                    row["open_time"],
+                    "ai",
+                    float(plan.get("score", 0.0)),
+                    snapshot,
+                )
+                same_symbol_live += 1
+            finally:
+                self.capital_trade.setText(capital_backup)
+
+        self.ai_pending_entries = remaining
 
     def run_strategy(self):
         scored = self.score_current_row()
@@ -1741,6 +2496,21 @@ class MainWindow(QMainWindow):
 
         return candles, e20, e50, e200
 
+    def current_ai_limit_levels(self) -> List[float]:
+        symbol = self.current_symbol_key()
+        levels = []
+        for plan in self.ai_pending_entries:
+            if str(plan.get("symbol", "")).strip().upper() == symbol:
+                try:
+                    levels.append(float(plan.get("trigger_price", 0.0)))
+                except Exception:
+                    continue
+        if levels:
+            return levels
+        if self.ai_enabled:
+            return [float(x) for x in self.latest_ai_decision.get("limits", []) if x is not None]
+        return []
+
     def sync_chart_full(self):
         if self.df.empty:
             return
@@ -1749,11 +2519,12 @@ class MainWindow(QMainWindow):
             return
 
         candles, e20, e50, e200 = self.build_chart_payload()
+        ai_limits = self.current_ai_limit_levels()
         auto_follow = "true" if self.auto_follow.isChecked() else "false"
 
         self.js_chart(
             f"window.chartApi.setAutoFollow({auto_follow});"
-            f"window.chartApi.setAll({json.dumps(candles)}, {json.dumps(e20)}, {json.dumps(e50)}, {json.dumps(e200)}, {json.dumps(self.current_markers()[-300:])});"
+            f"window.chartApi.setAll({json.dumps(candles)}, {json.dumps(e20)}, {json.dumps(e50)}, {json.dumps(e200)}, {json.dumps(self.current_markers()[-300:])}, {json.dumps(ai_limits)});"
         )
 
     def sync_chart_update(self):
@@ -1771,11 +2542,12 @@ class MainWindow(QMainWindow):
         e20v = float(row["ema20"]) if pd.notna(row["ema20"]) else None
         e50v = float(row["ema50"]) if pd.notna(row["ema50"]) else None
         e200v = float(row["ema200"]) if pd.notna(row["ema200"]) else None
+        ai_limits = self.current_ai_limit_levels()
         auto_follow = "true" if self.auto_follow.isChecked() else "false"
 
         self.js_chart(
             f"window.chartApi.setAutoFollow({auto_follow});"
-            f"window.chartApi.updateOne({json.dumps(bar)}, {json.dumps(e20v)}, {json.dumps(e50v)}, {json.dumps(e200v)}, {json.dumps(self.current_markers()[-300:])});"
+            f"window.chartApi.updateOne({json.dumps(bar)}, {json.dumps(e20v)}, {json.dumps(e50v)}, {json.dumps(e200v)}, {json.dumps(self.current_markers()[-300:])}, {json.dumps(ai_limits)});"
         )
 
     def selected_long_checks(self):
@@ -1851,6 +2623,23 @@ class MainWindow(QMainWindow):
 
         return {"true_signals": true_signals, "false_signals": false_signals}
 
+    def get_ai_entry_snapshot(self, side: str, scored: Optional[Dict[str, Any]] = None) -> Dict[str, List[str]]:
+        if scored is None:
+            scored = self.score_current_row()
+        if scored is None:
+            return {"true_signals": [], "false_signals": []}
+
+        if side == "long":
+            checks = scored["long_checks"]
+            prefix = "LONG | "
+        else:
+            checks = scored["short_checks"]
+            prefix = "SHORT | "
+
+        true_signals = [prefix + key for key, ok in checks.items() if ok]
+        false_signals = [prefix + key for key, ok in checks.items() if not ok]
+        return {"true_signals": true_signals, "false_signals": false_signals}
+
     def load_history(self):
         symbol = self.current_symbol_key()
         interval = self.interval.currentText().strip()
@@ -1870,6 +2659,7 @@ class MainWindow(QMainWindow):
         self.history_worker = None
         self.df = df
         self.last_closed_candle_time = self.df.iloc[-1]["open_time"] if not self.df.empty else None
+        self.ai_pending_entries = []
 
         if not self.closed_trades and not self.positions_by_symbol:
             self.balance_total = float(self.start_balance.text())
@@ -1934,11 +2724,16 @@ class MainWindow(QMainWindow):
         self.current_symbol = None
         self.current_interval = None
         self.depth_history.clear()
+        self.ai_pending_entries = []
         self.heatmap_acc = OrderBookHeatmapAccumulator(max_snapshots=250)
         self.last_heatmap_push_ts = 0.0
         self.last_analytics_start_ts = 0.0
 
     def start_auto(self):
+        if self.ai_enabled:
+            self.lbl_status.setText("AI Bot is ON. Disable AI Bot to use normal auto trading.")
+            self.refresh_panels()
+            return
         self.auto_enabled = True
         self.lbl_auto.setText("Auto Trading: ON")
         self.refresh_panels()
@@ -1947,6 +2742,30 @@ class MainWindow(QMainWindow):
         self.auto_enabled = False
         self.lbl_auto.setText("Auto Trading: OFF")
         self.refresh_panels()
+
+    def enable_ai_bot(self):
+        self.ai_enabled = True
+        self.auto_enabled = False
+        self.lbl_auto.setText("Auto Trading: OFF")
+        self.lbl_ai_bot.setText("AI Bot: ON")
+        self.btn_ai_toggle.setText("Disable AI Bot")
+        self.ai_stats["status_msg"] = "AI bot enabled"
+        self.run_ai_scan()
+        self.refresh_panels()
+
+    def disable_ai_bot(self):
+        self.ai_enabled = False
+        self.lbl_ai_bot.setText("AI Bot: OFF")
+        self.btn_ai_toggle.setText("Enable AI Bot")
+        self.ai_pending_entries = []
+        self.ai_stats["status_msg"] = "AI bot disabled"
+        self.refresh_panels()
+
+    def toggle_ai_bot(self):
+        if self.ai_enabled:
+            self.disable_ai_bot()
+        else:
+            self.enable_ai_bot()
 
     def manual_long(self):
         if self.df.empty or self.current_position() is not None:
@@ -1965,9 +2784,10 @@ class MainWindow(QMainWindow):
         self.enter_position("short", float(self.df.iloc[-1]["close"]), self.df.iloc[-1]["open_time"], "manual", entry_score, snapshot)
 
     def manual_close(self):
-        if self.df.empty or self.current_position() is None:
+        if self.df.empty or not self.current_positions():
             return
-        self.exit_position("manual_close", float(self.df.iloc[-1]["close"]), self.df.iloc[-1]["open_time"])
+        for pos in list(self.current_positions()):
+            self.exit_position("manual_close", float(self.df.iloc[-1]["close"]), self.df.iloc[-1]["open_time"], pos)
 
     def enter_position(self, side: str, price: float, tstamp: pd.Timestamp, source: str, score_at_entry: float = 0.0, entry_snapshot: Optional[Dict[str, List[str]]] = None):
         self.ensure_daily_stats_current(self.to_local_ts(tstamp))
@@ -2006,7 +2826,9 @@ class MainWindow(QMainWindow):
 
         self.available_balance -= capital
         self.daily_trade_count += 1
-        self.set_current_position(pos)
+        if str(source).lower().startswith("ai"):
+            self.ai_stats["ai_trades_opened"] += 1
+        self.add_position(pos)
 
         markers = self.current_markers()
         markers.append({
@@ -2076,8 +2898,8 @@ class MainWindow(QMainWindow):
                 s["avg_score"] = s["score"] / s["participated"]
                 s["power"] = s["score"]
 
-    def exit_position(self, reason: str, exit_price: float, tstamp: pd.Timestamp):
-        pos = self.current_position()
+    def exit_position(self, reason: str, exit_price: float, tstamp: pd.Timestamp, pos_to_close: Optional[Position] = None):
+        pos = pos_to_close or self.current_position()
         if pos is None:
             return
 
@@ -2134,8 +2956,16 @@ class MainWindow(QMainWindow):
 
         self.closed_trades.append(trade)
         self.update_signal_stats_from_trade(trade, entry_snapshot)
+        if str(pos.source).lower().startswith("ai"):
+            self.ai_stats["ai_trades_closed"] += 1
+            self.pending_exit_watch.append({
+                "side": pos.side,
+                "exit_price": float(exit_price),
+                "bars_left": 3,
+                "trigger_pct": 0.15,
+            })
 
-        self.set_current_position(None)
+        self.remove_position(pos)
         self.update_equity()
         self.refresh_panels()
         self.sync_chart_full()
@@ -2150,16 +2980,17 @@ class MainWindow(QMainWindow):
 
     def refresh_trade_tab(self):
         open_lines = []
-        for sym, pos in self.positions_by_symbol.items():
-            snap = getattr(pos, "entry_snapshot", {"true_signals": [], "false_signals": []})
-            open_lines.append(
-                f"{sym} | {pos.side.upper()} | {pos.source.upper()} | "
-                f"Entry={pos.entry_price:.4f} | Capital={pos.capital_usdt:.2f} | "
-                f"Lev={pos.leverage:.1f}x | Qty={pos.qty:.6f} | Bars={pos.bars_held} | "
-                f"Score={pos.score_at_entry:.2f} | "
-                f"TRUE={', '.join(snap.get('true_signals', []))} | "
-                f"FALSE={', '.join(snap.get('false_signals', []))}"
-            )
+        for sym, positions in self.positions_by_symbol.items():
+            for pos in self.positions_for_symbol(sym):
+                snap = getattr(pos, "entry_snapshot", {"true_signals": [], "false_signals": []})
+                open_lines.append(
+                    f"{sym} | {pos.side.upper()} | {pos.source.upper()} | "
+                    f"Entry={pos.entry_price:.4f} | Capital={pos.capital_usdt:.2f} | "
+                    f"Lev={pos.leverage:.1f}x | Qty={pos.qty:.6f} | Bars={pos.bars_held} | "
+                    f"Score={pos.score_at_entry:.2f} | "
+                    f"TRUE={', '.join(snap.get('true_signals', []))} | "
+                    f"FALSE={', '.join(snap.get('false_signals', []))}"
+                )
         if not open_lines:
             open_lines = ["No open trades"]
 
@@ -2221,26 +3052,31 @@ class MainWindow(QMainWindow):
                 self.tbl_signal_stats.setItem(r, c, item)
 
     def update_equity(self):
-        pos = self.current_position()
         if self.df.empty:
             return
 
-        if pos is None:
+        positions = self.current_positions()
+        if not positions:
             self.equity = self.balance_total
             self.lbl_live_pnl.setText("Live Position PnL: 0.00 | ROI: 0.00%")
         else:
             last_price = float(self.df.iloc[-1]["close"])
-            if pos.side == "long":
-                unreal = (last_price - pos.entry_price) * pos.qty
-            else:
-                unreal = (pos.entry_price - last_price) * pos.qty
+            total_capital = 0.0
+            total_live_net = 0.0
+            for pos in positions:
+                if pos.side == "long":
+                    unreal = (last_price - pos.entry_price) * pos.qty
+                else:
+                    unreal = (pos.entry_price - last_price) * pos.qty
+                close_fee = pos.notional_usdt * self.fee_rate()
+                total_live_net += unreal - pos.entry_fee - close_fee
+                total_capital += pos.capital_usdt
 
-            close_fee = pos.notional_usdt * self.fee_rate()
-            live_net = unreal - pos.entry_fee - close_fee
-            live_roi = (live_net / pos.capital_usdt) * 100.0 if pos.capital_usdt > 0 else 0.0
-
-            self.equity = self.available_balance + pos.capital_usdt + live_net
-            self.lbl_live_pnl.setText(f"Live Position PnL: {live_net:.4f} | ROI: {live_roi:.2f}%")
+            live_roi = (total_live_net / total_capital) * 100.0 if total_capital > 0 else 0.0
+            self.equity = self.available_balance + total_capital + total_live_net
+            self.lbl_live_pnl.setText(
+                f"Live Position PnL: {total_live_net:.4f} | ROI: {live_roi:.2f}% | Trades: {len(positions)}"
+            )
 
         self.lbl_balance.setText(f"Total Balance: {self.balance_total:.2f}")
         self.lbl_available.setText(f"Available Balance: {self.available_balance:.2f}")
@@ -2365,12 +3201,13 @@ class MainWindow(QMainWindow):
 
         self.ensure_daily_stats_current()
         row = self.df.iloc[-1]
-        pos = self.current_position()
+        positions = self.current_positions()
+        pos = positions[-1] if positions else None
         scored = self.score_current_row()
 
         if pos:
             self.lbl_position.setText(
-                f"Position: {pos.side.upper()} | {pos.source.upper()} | Entry {pos.entry_price:.4f} | Lev {pos.leverage:.1f}x"
+                f"Position: {len(positions)} live | Last {pos.side.upper()} | {pos.source.upper()} | Entry {pos.entry_price:.4f} | Lev {pos.leverage:.1f}x"
             )
         else:
             self.lbl_position.setText("Position: Flat")
@@ -2450,6 +3287,7 @@ class MainWindow(QMainWindow):
         self.refresh_signal_stats_tab()
         self.refresh_psychology_tab()
         self.refresh_strategy_tab(scored)
+        self.refresh_ai_bot_tab(scored)
 
     def check_exit(self, pos: Position, row: pd.Series):
         tp_pct = float(self.tp.text())
@@ -2476,8 +3314,8 @@ class MainWindow(QMainWindow):
         return None, None
 
     def check_intrabar_exit(self):
-        pos = self.current_position()
-        if pos is None or self.df.empty:
+        positions = list(self.current_positions())
+        if not positions or self.df.empty:
             return
 
         row = self.df.iloc[-1]
@@ -2486,14 +3324,14 @@ class MainWindow(QMainWindow):
         fee_rate = self.fee_rate()
 
         last_price = float(row["close"])
-        live_roi = self.current_live_roi_pct(pos.side, pos.entry_price, last_price, pos.leverage, fee_rate)
+        for pos in positions:
+            live_roi = self.current_live_roi_pct(pos.side, pos.entry_price, last_price, pos.leverage, fee_rate)
 
-        if live_roi >= tp_pct:
-            self.exit_position("take_profit", last_price, row["open_time"])
-            return
-        if live_roi <= -sl_pct:
-            self.exit_position("stop_loss", last_price, row["open_time"])
-            return
+            if live_roi >= tp_pct:
+                self.exit_position("take_profit", last_price, row["open_time"], pos)
+                continue
+            if live_roi <= -sl_pct:
+                self.exit_position("stop_loss", last_price, row["open_time"], pos)
 
     def apply_tick(self, row: dict):
         if row.get("symbol") and self.current_symbol and row["symbol"].lower() != self.current_symbol:
@@ -2532,6 +3370,13 @@ class MainWindow(QMainWindow):
         else:
             self.df = compute_indicators(self.df)
 
+        live_scored = self.score_current_row() if len(self.df) >= 220 else None
+        if self.ai_pending_entries:
+            try:
+                self.process_ai_limit_entries(self.df.iloc[-1], live_scored)
+            except Exception:
+                pass
+
         if bool(row["is_closed"]):
             closed_time = row["open_time"]
             if self.last_closed_candle_time is None or closed_time > self.last_closed_candle_time:
@@ -2540,7 +3385,10 @@ class MainWindow(QMainWindow):
 
         self.update_equity()
         self.check_intrabar_exit()
-        self.refresh_trade_status_bar()
+        if not bool(row["is_closed"]):
+            self.refresh_trade_status_bar(live_scored)
+            if self.ai_enabled:
+                self.refresh_ai_bot_tab(live_scored)
 
     def handle_depth(self, item: Dict[str, Any]):
         if item.get("symbol") != self.current_symbol_key():
@@ -2655,19 +3503,41 @@ class MainWindow(QMainWindow):
 
         row = self.df.iloc[-1]
         signal = "No selected setup"
+        self.process_pending_exit_watch(row)
 
-        pos = self.current_position()
-        if pos is not None:
+        open_positions = list(self.current_positions())
+        for pos in open_positions:
             pos.bars_held += 1
-            self.set_current_position(pos)
             reason, exit_price = self.check_exit(pos, row)
             if reason is not None:
-                self.exit_position(reason, exit_price, row["open_time"])
+                self.exit_position(reason, exit_price, row["open_time"], pos)
 
         scored = self.score_current_row()
         evaluation = self.evaluate_psychology(scored) if scored is not None else None
+        ai_decision = self.build_ai_decision(scored, evaluation) if scored is not None else None
 
-        if self.current_position() is None and self.auto_enabled and scored is not None:
+        if self.ai_enabled and scored is not None:
+            if ai_decision and ai_decision.get("state") == "READY" and ai_decision.get("side") in {"long", "short"}:
+                self.rebuild_ai_pending_entries(ai_decision, row)
+                self.process_ai_limit_entries(row, scored)
+                signal = (
+                    f"AI {ai_decision['side'].upper()} ARMED | "
+                    f"{len(self.ai_pending_entries)} limit(s) pending | "
+                    f"Conf {ai_decision.get('confidence', 0.0):.2f}"
+                )
+            elif ai_decision is not None:
+                self.ai_pending_entries = []
+                blockers = ai_decision.get("blockers", [])
+                side = str(ai_decision.get("side") or "flat").upper()
+                signal = f"AI {side} WAIT | {'; '.join(blockers[:2])}" if blockers else ai_decision.get("summary", "AI waiting")
+            else:
+                self.ai_pending_entries = []
+                signal = (
+                    f"AI waiting | "
+                    f"L={scored.get('long_score_user', scored['long_score']):.2f} "
+                    f"S={scored.get('short_score_user', scored['short_score']):.2f}"
+                )
+        elif self.auto_enabled and scored is not None:
             long_blockers = self.entry_blockers_for_side("long", scored, evaluation, include_auto_state=False, include_position_state=False)
             short_blockers = self.entry_blockers_for_side("short", scored, evaluation, include_auto_state=False, include_position_state=False)
 
@@ -2741,5 +3611,7 @@ class MainWindow(QMainWindow):
         if self.worker is not None and self.worker.isRunning():
             self.worker.quit()
             self.worker.wait(1000)
+        if self.ai_scanner_worker is not None and self.ai_scanner_worker.isRunning():
+            self.ai_scanner_worker.quit()
+            self.ai_scanner_worker.wait(1000)
         super().closeEvent(event)
-
